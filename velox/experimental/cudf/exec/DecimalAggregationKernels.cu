@@ -17,8 +17,8 @@
 
 #include <cudf/column/column_device_view.cuh>
 #include <cudf/column/column_factories.hpp>
-#include <cudf/detail/null_mask.hpp>
 #include <cudf/detail/valid_if.cuh>
+#include <cudf/null_mask.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/strings/utilities.hpp>
 #include <cudf/utilities/error.hpp>
@@ -153,8 +153,7 @@ std::pair<rmm::device_buffer, cudf::size_type> buildStateValidityMask(
   StateValidPredicate pred{*sumDeviceView, *countDeviceView};
   auto begin = thrust::make_counting_iterator<cudf::size_type>(0);
   auto end = begin + numRows;
-  return cudf::detail::valid_if(
-      begin, end, pred, stream, mr);
+  return cudf::detail::valid_if(begin, end, pred, stream, mr);
 }
 
 } // namespace
@@ -248,12 +247,10 @@ DecimalSumStateColumns deserializeDecimalSumStateWithCount(
   }
 
   if (stateCol.nullable()) {
-    auto nullMask = cudf::detail::copy_bitmask(
-        stateCol, stream, mr);
+    auto nullMask = cudf::copy_bitmask(stateCol, stream, mr);
     auto nullCount = stateCol.null_count();
     sumCol->set_null_mask(std::move(nullMask), nullCount);
-    auto countMask = cudf::detail::copy_bitmask(
-        stateCol, stream, mr);
+    auto countMask = cudf::copy_bitmask(stateCol, stream, mr);
     countCol->set_null_mask(std::move(countMask), nullCount);
   }
 
@@ -268,7 +265,8 @@ std::unique_ptr<cudf::column> deserializeDecimalSumState(
     int32_t scale,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
-  auto decoded = deserializeDecimalSumStateWithCount(stateCol, scale, stream, mr);
+  auto decoded =
+      deserializeDecimalSumStateWithCount(stateCol, scale, stream, mr);
   return std::move(decoded.sum);
 }
 
@@ -372,7 +370,8 @@ std::unique_ptr<cudf::column> serializeDecimalSumState(
     CUDF_CUDA_TRY(cudaGetLastError());
   }
 
-  auto [nullMask, nullCount] = buildStateValidityMask(sumCol, countCol, stream, mr);
+  auto [nullMask, nullCount] =
+      buildStateValidityMask(sumCol, countCol, stream, mr);
   return cudf::make_strings_column(
       static_cast<cudf::size_type>(numRows),
       std::move(offsetsCol),
@@ -420,7 +419,8 @@ std::unique_ptr<cudf::column> computeDecimalAverage(
     CUDF_CUDA_TRY(cudaGetLastError());
   }
 
-  auto [nullMask, nullCount] = buildStateValidityMask(sumCol, countCol, stream, mr);
+  auto [nullMask, nullCount] =
+      buildStateValidityMask(sumCol, countCol, stream, mr);
   if (nullCount > 0) {
     out->set_null_mask(std::move(nullMask), nullCount);
   } else if (nullMask.size() > 0) {

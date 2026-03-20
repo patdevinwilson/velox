@@ -1161,7 +1161,8 @@ TEST_F(CudfDecimalTest, decimalComputeAverageDecimal64) {
 
   auto sumCol = makeDecimalColumn<int64_t>(sums, 2, &sumValid, stream);
   auto countCol = makeInt64Column(counts, &countValid, stream);
-  auto avgCol = computeDecimalAverage(sumCol->view(), countCol->view(), stream, mr);
+  auto avgCol =
+      computeDecimalAverage(sumCol->view(), countCol->view(), stream, mr);
 
   auto avgMask = copyNullMask(avgCol->view(), stream);
   auto outAvg = copyColumnData<int64_t>(avgCol->view(), stream);
@@ -1197,7 +1198,8 @@ TEST_F(CudfDecimalTest, decimalComputeAverageDecimal128) {
 
   auto sumCol = makeDecimalColumn<__int128_t>(sums, 3, &sumValid, stream);
   auto countCol = makeInt64Column(counts, &countValid, stream);
-  auto avgCol = computeDecimalAverage(sumCol->view(), countCol->view(), stream, mr);
+  auto avgCol =
+      computeDecimalAverage(sumCol->view(), countCol->view(), stream, mr);
 
   auto avgMask = copyNullMask(avgCol->view(), stream);
   auto outAvg = copyColumnData<__int128_t>(avgCol->view(), stream);

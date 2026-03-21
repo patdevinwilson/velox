@@ -294,6 +294,13 @@ velox_add_cudf_test(
   LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_window
 )
 
+
+velox_add_cudf_test(
+  NAME velox_cudf_geospatial_test
+  SOURCES Main.cpp GeospatialTest.cpp
+  LIBS ${CUDF_TEST_DEFAULT_LIBS} velox_functions_test_lib
+)
+
 add_subdirectory(iceberg)
 add_subdirectory(utils)
 

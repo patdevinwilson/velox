@@ -133,10 +133,11 @@ RowVectorPtr CudfMarkDistinct::getOutput() {
   static_cast<cudf::numeric_scalar<bool>&>(*trueScalar)
       .set_value(true, stream);
 
-  // Convert distinctIdx to a column, filter to new-batch range, adjust to
-  // local indices, and scatter true values into the mask.
+  // Convert distinctIdx device_uvector to a column for cuDF operations.
   auto distinctIdxCol = std::make_unique<cudf::column>(
-      std::move(*distinctIdx),
+      cudf::data_type{cudf::type_id::UINT32},
+      static_cast<cudf::size_type>(distinctIdx->size()),
+      distinctIdx->release(),
       rmm::device_buffer(0, stream, mr),
       0);
 

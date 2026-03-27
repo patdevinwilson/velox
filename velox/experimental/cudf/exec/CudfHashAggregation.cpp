@@ -2011,6 +2011,7 @@ bool registerStepAwareBuiltinAggregationFunctions(const std::string& prefix) {
           .argumentType("double")
           .build(),
       FunctionSignatureBuilder()
+<<<<<<< HEAD
           .returnType("varchar")
           .argumentType("varchar")
           .build(),
@@ -2019,6 +2020,14 @@ bool registerStepAwareBuiltinAggregationFunctions(const std::string& prefix) {
           .integerVariable("s")
           .returnType("decimal(p,s)")
           .argumentType("decimal(p,s)")
+=======
+          .returnType("date")
+          .argumentType("date")
+          .build(),
+      FunctionSignatureBuilder()
+          .returnType("timestamp")
+          .argumentType("timestamp")
+>>>>>>> mattgara/timestamp-basic
           .build()};
 
   registerAggregationFunctionForStep(

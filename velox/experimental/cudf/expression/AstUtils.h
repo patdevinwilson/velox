@@ -16,6 +16,7 @@
 #pragma once
 
 #include "velox/expression/ConstantExpr.h"
+#include "velox/type/Timestamp.h"
 #include "velox/type/Type.h"
 #include "velox/vector/BaseVector.h"
 #include "velox/vector/SimpleVector.h"
@@ -24,6 +25,7 @@
 #include <cudf/ast/expressions.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/scalar/scalar.hpp>
+#include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 
 namespace facebook::velox::cudf_velox {
@@ -91,6 +93,7 @@ std::unique_ptr<cudf::scalar> makeScalarFromValue(
   auto stream = cudf::get_default_stream();
   auto mr = cudf::get_current_device_resource_ref();
 
+<<<<<<< HEAD
   // Scalars are constructed once at init time but later consumed on
   // an arbitrary per-batch CUDA stream.  The underlying device_buffer
   // is allocated with cudaMallocAsync on `stream`.  Without a sync
@@ -100,6 +103,14 @@ std::unique_ptr<cudf::scalar> makeScalarFromValue(
   // available on every stream.
 
   if constexpr (cudf::is_fixed_width<T>()) {
+=======
+  if constexpr (std::is_same_v<T, Timestamp>) {
+    using CudfTimestampType = cudf::timestamp_ns;
+    auto nanos = isNull ? 0 : value.toNanos();
+    return std::make_unique<cudf::timestamp_scalar<CudfTimestampType>>(
+        CudfTimestampType{cudf::duration_ns{nanos}}, !isNull, stream, mr);
+  } else if constexpr (cudf::is_fixed_width<T>()) {
+>>>>>>> mattgara/timestamp-basic
     if (type->isDecimal()) {
       // Velox DECIMAL scale is positive for fractional digits
       // cuDF scale is negative for fractional digits

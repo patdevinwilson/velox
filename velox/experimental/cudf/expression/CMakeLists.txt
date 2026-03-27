@@ -15,7 +15,11 @@
 add_library(
   velox_cudf_expression
   AstExpression.cpp
+<<<<<<< HEAD
   DecimalExpressionKernels.cu
+=======
+  AstTypeUtils.cpp
+>>>>>>> mattgara/timestamp-basic
   ExpressionEvaluator.cpp
   JitExpression.cpp
   SubfieldFiltersToAst.cpp

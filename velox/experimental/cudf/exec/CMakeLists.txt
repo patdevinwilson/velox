@@ -25,6 +25,7 @@ add_library(
   CudfOrderBy.cpp
   CudfBatchConcat.cpp
   CudfTopN.cpp
+  CudfWindow.cpp
   DebugUtil.cpp
   GpuResources.cpp
   OperatorAdapters.cpp

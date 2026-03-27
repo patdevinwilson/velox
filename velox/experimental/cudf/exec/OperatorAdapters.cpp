@@ -23,6 +23,7 @@
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
 #include "velox/experimental/cudf/exec/CudfLimit.h"
+#include "velox/experimental/cudf/exec/CudfMarkDistinct.h"
 #include "velox/experimental/cudf/exec/CudfLocalMerge.h"
 #include "velox/experimental/cudf/exec/CudfLocalPartition.h"
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
@@ -33,6 +34,8 @@
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
 #include "velox/exec/AssignUniqueId.h"
+#include "velox/exec/EnforceSingleRow.h"
+#include "velox/exec/MarkDistinct.h"
 #include "velox/exec/CallbackSink.h"
 #include "velox/exec/FilterProject.h"
 #include "velox/exec/HashAggregation.h"
@@ -713,6 +716,79 @@ class AssignUniqueIdAdapter : public OperatorAdapter {
 };
 
 /// ValuesAdapter - Keeps original operator
+/// MarkDistinctAdapter - Replaces with CudfMarkDistinct
+class MarkDistinctAdapter : public OperatorAdapter {
+ public:
+  MarkDistinctAdapter() : OperatorAdapter("MarkDistinct") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::MarkDistinct*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    return std::dynamic_pointer_cast<const core::MarkDistinctNode>(planNode) !=
+        nullptr;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto mdNode =
+        std::dynamic_pointer_cast<const core::MarkDistinctNode>(planNode);
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfMarkDistinct>(operatorId, ctx, mdNode));
+    return result;
+  }
+};
+
+/// EnforceSingleRowAdapter - Pass-through: the CPU operator works with
+/// CudfVector (only checks size() == 1 and buffers).
+class EnforceSingleRowAdapter : public OperatorAdapter {
+ public:
+  EnforceSingleRowAdapter() : OperatorAdapter("EnforceSingleRow") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::EnforceSingleRow*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/) const override {
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const override {
+    return {};
+  }
+};
+
 class ValuesAdapter : public OperatorAdapter {
  public:
   ValuesAdapter() : OperatorAdapter("Values") {}
@@ -919,6 +995,8 @@ void registerAllOperatorAdapters() {
   registry.registerAdapter(std::make_unique<LocalExchangeAdapter>());
   registry.registerAdapter(std::make_unique<LocalMergeAdapter>());
   registry.registerAdapter(std::make_unique<AssignUniqueIdAdapter>());
+  registry.registerAdapter(std::make_unique<MarkDistinctAdapter>());
+  registry.registerAdapter(std::make_unique<EnforceSingleRowAdapter>());
   registry.registerAdapter(std::make_unique<ValuesAdapter>());
   registry.registerAdapter(std::make_unique<CallbackSinkAdapter>());
   registry.registerAdapter(std::make_unique<PartitionedOutputAdapter>());

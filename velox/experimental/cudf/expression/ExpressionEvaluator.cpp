@@ -31,6 +31,7 @@
 #include <cudf/datetime.hpp>
 #include <cudf/hashing.hpp>
 #include <cudf/lists/count_elements.hpp>
+#include <cudf/lists/extract.hpp>
 #include <cudf/replace.hpp>
 #include <cudf/round.hpp>
 #include <cudf/strings/attributes.hpp>
@@ -331,6 +332,36 @@ class CardinalityFunction : public CudfFunction {
   }
 };
 
+/// subscript(array, index) -- extracts element at 1-based index.
+/// cuDF uses 0-based indexing, so we subtract 1 from the index.
+/// OOB returns null (cuDF behavior) rather than throwing (Presto behavior).
+class SubscriptFunction : public CudfFunction {
+ public:
+  SubscriptFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(), 2, "subscript expects exactly 2 inputs");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    auto listCol = asView(inputColumns[0]);
+    auto indexCol = asView(inputColumns[1]);
+
+    // Adjust from 1-based (Presto) to 0-based (cuDF)
+    auto oneScalar = cudf::numeric_scalar<int32_t>(1, true, stream);
+    auto adjustedIndex = cudf::binary_operation(
+        indexCol, oneScalar, cudf::binary_operator::SUB,
+        cudf::data_type{cudf::type_id::INT32}, stream, mr);
+
+    return cudf::lists::extract_list_element(
+        cudf::lists_column_view(listCol),
+        adjustedIndex->view(),
+        stream, mr);
+  }
+};
+
 class RoundFunction : public CudfFunction {
  public:
   explicit RoundFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
@@ -351,13 +382,21 @@ class RoundFunction : public CudfFunction {
       std::vector<ColumnOrView>& inputColumns,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
+    auto inputView = asView(inputColumns[0]);
+    if (cudf::is_floating_point(inputView.type())) {
+      return cudf::round(
+          inputView,
+          scale_,
+          cudf::rounding_method::HALF_UP,
+          stream,
+          mr);
+    }
     return cudf::round_decimal(
-        asView(inputColumns[0]),
+        inputView,
         scale_,
         cudf::rounding_method::HALF_UP,
         stream,
         mr);
-    ;
   }
 
  private:
@@ -1358,6 +1397,18 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .argumentType("array(any)")
            .build()});
 
+  registerCudfFunction(
+      prefix + "subscript",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<SubscriptFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .typeVariable("T")
+           .returnType("T")
+           .argumentType("array(T)")
+           .argumentType("bigint")
+           .build()});
+
   registerCudfFunctions(
       {prefix + "substr", prefix + "substring"},
       [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
@@ -1514,6 +1565,24 @@ bool registerBuiltinFunctions(const std::string& prefix) {
        FunctionSignatureBuilder()
            .returnType("bigint")
            .argumentType("bigint")
+           .constantArgumentType("integer")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("double")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("double")
+           .constantArgumentType("integer")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("real")
+           .argumentType("real")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("real")
+           .argumentType("real")
            .constantArgumentType("integer")
            .build()});
 

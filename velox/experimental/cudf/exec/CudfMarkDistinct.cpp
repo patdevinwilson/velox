@@ -23,11 +23,16 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
-#include <cudf/join.hpp>
+#include <cudf/stream_compaction.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 
 #include <nvtx3/nvtx3.hpp>
+
+#include <thrust/device_vector.h>
+#include <thrust/sequence.h>
+#include <thrust/set_operations.h>
+#include <thrust/sort.h>
 
 namespace facebook::velox::cudf_velox {
 
@@ -81,128 +86,119 @@ RowVectorPtr CudfMarkDistinct::getOutput() {
   // Extract key columns from input
   auto keyView = inputView.select(keyColumnIndices_);
 
-  // Create boolean mask: all true initially
-  auto allTrue = cudf::make_numeric_scalar(
-      cudf::data_type{cudf::type_id::BOOL8}, stream, mr);
-  allTrue->set_valid_async(true, stream);
-  static_cast<cudf::numeric_scalar<bool>&>(*allTrue).set_value(true, stream);
-  auto maskCol = cudf::make_column_from_scalar(*allTrue, numRows, stream, mr);
+  // Strategy: concatenate seenKeys_ (if any) with this batch's keys, then
+  // run distinct_indices on the combined table. Indices that fall in the
+  // new batch range [seenCount, seenCount+numRows) are "first occurrence".
+  const cudf::size_type seenCount =
+      seenKeys_ ? seenKeys_->num_rows() : 0;
 
-  if (seenKeys_ != nullptr && seenKeys_->num_rows() > 0) {
-    // Find rows whose keys already exist in seenKeys_ via left_semi_join
-    auto seenView = seenKeys_->view();
-    std::vector<cudf::size_type> leftOn(keyColumnIndices_.size());
-    std::vector<cudf::size_type> rightOn(keyColumnIndices_.size());
-    std::iota(leftOn.begin(), leftOn.end(), 0);
-    std::iota(rightOn.begin(), rightOn.end(), 0);
-
-    auto matchIndices = cudf::left_semi_join(
-        keyView, seenView, leftOn, rightOn,
-        cudf::null_equality::EQUAL, stream, mr);
-
-    // Set mask to false for rows that matched (already seen)
-    if (matchIndices->size() > 0) {
-      auto falseScalar = cudf::make_numeric_scalar(
-          cudf::data_type{cudf::type_id::BOOL8}, stream, mr);
-      falseScalar->set_valid_async(true, stream);
-      static_cast<cudf::numeric_scalar<bool>&>(*falseScalar)
-          .set_value(false, stream);
-
-      auto indicesCol = std::make_unique<cudf::column>(
-          cudf::data_type{cudf::type_id::INT32},
-          matchIndices->size(),
-          matchIndices->release(),
-          rmm::device_buffer{},
-          0);
-      auto scatterSrc = cudf::make_column_from_scalar(
-          *falseScalar, matchIndices->size(), stream, mr);
-      auto scatterTable = cudf::table_view({scatterSrc->view()});
-      auto targetTable = cudf::table_view({maskCol->view()});
-      auto scattered =
-          cudf::scatter(scatterTable, indicesCol->view(), targetTable,
-                        stream, mr);
-      maskCol = std::move(scattered->release()[0]);
-    }
+  std::unique_ptr<cudf::table> combinedKeys;
+  if (seenKeys_ && seenCount > 0) {
+    auto views = std::vector<cudf::table_view>{seenKeys_->view(), keyView};
+    combinedKeys = cudf::concatenate(views, stream, mr);
+  } else {
+    combinedKeys = std::make_unique<cudf::table>(keyView, stream, mr);
   }
 
-  // Within this batch, handle intra-batch duplicates: for rows with keys
-  // that appear earlier in the same batch and are NOT already in seenKeys_,
-  // only the first occurrence should be true.
-  // Use cudf::distinct to find first-occurrence indices within the batch keys.
-  auto distinctIndices = cudf::distinct_indices(
-      keyView,
+  // All key columns participate in distinct
+  std::vector<cudf::size_type> allCols(combinedKeys->num_columns());
+  std::iota(allCols.begin(), allCols.end(), 0);
+
+  auto distinctIdx = cudf::distinct_indices(
+      combinedKeys->view(),
       cudf::duplicate_keep_option::KEEP_FIRST,
       cudf::null_equality::EQUAL,
       cudf::nan_equality::ALL_EQUAL,
       stream,
       mr);
 
-  if (distinctIndices->size() < static_cast<std::size_t>(numRows)) {
-    // Some intra-batch duplicates exist. Build a "is first occurrence" mask.
-    auto firstOccurrence = cudf::make_numeric_scalar(
-        cudf::data_type{cudf::type_id::BOOL8}, stream, mr);
-    firstOccurrence->set_valid_async(true, stream);
-    static_cast<cudf::numeric_scalar<bool>&>(*firstOccurrence)
-        .set_value(false, stream);
-    auto intraMask = cudf::make_column_from_scalar(
-        *firstOccurrence, numRows, stream, mr);
+  // Build boolean mask: for each row in [0, numRows), check if
+  // (seenCount + row) appears in distinctIdx.
+  // We do this on GPU: create a sorted copy of distinctIdx, then for each
+  // row index in [seenCount, seenCount+numRows), binary search.
+  auto falseScalar = cudf::make_numeric_scalar(
+      cudf::data_type{cudf::type_id::BOOL8}, stream, mr);
+  falseScalar->set_valid_async(true, stream);
+  static_cast<cudf::numeric_scalar<bool>&>(*falseScalar)
+      .set_value(false, stream);
+  auto maskCol = cudf::make_column_from_scalar(*falseScalar, numRows, stream, mr);
 
-    auto trueScalar = cudf::make_numeric_scalar(
-        cudf::data_type{cudf::type_id::BOOL8}, stream, mr);
-    trueScalar->set_valid_async(true, stream);
-    static_cast<cudf::numeric_scalar<bool>&>(*trueScalar)
-        .set_value(true, stream);
+  // Filter distinctIdx to only indices in [seenCount, seenCount+numRows)
+  // and mark those positions as true in the mask.
+  auto trueScalar = cudf::make_numeric_scalar(
+      cudf::data_type{cudf::type_id::BOOL8}, stream, mr);
+  trueScalar->set_valid_async(true, stream);
+  static_cast<cudf::numeric_scalar<bool>&>(*trueScalar)
+      .set_value(true, stream);
 
-    auto distinctIndicesCol = std::make_unique<cudf::column>(
-        cudf::data_type{cudf::type_id::INT32},
-        distinctIndices->size(),
-        distinctIndices->release(),
-        rmm::device_buffer{},
-        0);
+  // Convert distinctIdx to a column, filter to new-batch range, adjust to
+  // local indices, and scatter true values into the mask.
+  auto distinctIdxCol = std::make_unique<cudf::column>(
+      cudf::data_type{cudf::type_id::UINT32},
+      distinctIdx->size(),
+      distinctIdx->release(),
+      rmm::device_buffer{},
+      0);
+
+  // Filter: keep only indices >= seenCount
+  auto seenCountScalar = cudf::make_numeric_scalar(
+      cudf::data_type{cudf::type_id::UINT32}, stream, mr);
+  seenCountScalar->set_valid_async(true, stream);
+  static_cast<cudf::numeric_scalar<uint32_t>&>(*seenCountScalar)
+      .set_value(static_cast<uint32_t>(seenCount), stream);
+
+  auto upperBoundScalar = cudf::make_numeric_scalar(
+      cudf::data_type{cudf::type_id::UINT32}, stream, mr);
+  upperBoundScalar->set_valid_async(true, stream);
+  static_cast<cudf::numeric_scalar<uint32_t>&>(*upperBoundScalar)
+      .set_value(static_cast<uint32_t>(seenCount + numRows), stream);
+
+  // ge_mask: index >= seenCount
+  auto geMask = cudf::binary_operation(
+      distinctIdxCol->view(), *seenCountScalar,
+      cudf::binary_operator::GREATER_EQUAL,
+      cudf::data_type{cudf::type_id::BOOL8}, stream, mr);
+  // lt_mask: index < seenCount + numRows
+  auto ltMask = cudf::binary_operation(
+      distinctIdxCol->view(), *upperBoundScalar,
+      cudf::binary_operator::LESS,
+      cudf::data_type{cudf::type_id::BOOL8}, stream, mr);
+  // combined filter
+  auto filterMask = cudf::binary_operation(
+      geMask->view(), ltMask->view(),
+      cudf::binary_operator::BITWISE_AND,
+      cudf::data_type{cudf::type_id::BOOL8}, stream, mr);
+
+  // Apply filter to get indices in the new batch range
+  auto filteredTable = cudf::apply_boolean_mask(
+      cudf::table_view({distinctIdxCol->view()}),
+      filterMask->view(), stream, mr);
+  auto filteredIndices = std::move(filteredTable->release()[0]);
+
+  if (filteredIndices->size() > 0) {
+    // Subtract seenCount to get local indices
+    auto localIndices = cudf::binary_operation(
+        filteredIndices->view(), *seenCountScalar,
+        cudf::binary_operator::SUB,
+        cudf::data_type{cudf::type_id::INT32}, stream, mr);
+
+    // Scatter true into mask at local indices
     auto scatterTrue = cudf::make_column_from_scalar(
-        *trueScalar, distinctIndicesCol->size(), stream, mr);
+        *trueScalar, localIndices->size(), stream, mr);
     auto scatterTable = cudf::table_view({scatterTrue->view()});
-    auto targetTable = cudf::table_view({intraMask->view()});
-    auto scattered =
-        cudf::scatter(scatterTable, distinctIndicesCol->view(), targetTable,
-                      stream, mr);
-    auto intraMaskResult = std::move(scattered->release()[0]);
-
-    // AND the intra-batch mask with the cross-batch mask
-    maskCol = cudf::binary_operation(
-        maskCol->view(), intraMaskResult->view(),
-        cudf::binary_operator::BITWISE_AND,
-        cudf::data_type{cudf::type_id::BOOL8},
-        stream, mr);
+    auto targetTable = cudf::table_view({maskCol->view()});
+    auto scattered = cudf::scatter(
+        scatterTable, localIndices->view(), targetTable, stream, mr);
+    maskCol = std::move(scattered->release()[0]);
   }
 
-  // Update seenKeys_ with all distinct keys from this batch
-  auto newKeysTable = std::make_unique<cudf::table>(keyView, stream, mr);
-  auto newDistinct = cudf::distinct(
-      newKeysTable->view(),
-      std::vector<cudf::size_type>(
-          keyColumnIndices_.size()),
+  // Update seenKeys_: take distinct from the combined table
+  seenKeys_ = cudf::distinct(
+      combinedKeys->view(), allCols,
       cudf::duplicate_keep_option::KEEP_FIRST,
       cudf::null_equality::EQUAL,
       cudf::nan_equality::ALL_EQUAL,
       stream, mr);
-
-  if (seenKeys_ != nullptr && seenKeys_->num_rows() > 0) {
-    auto views = std::vector<cudf::table_view>{
-        seenKeys_->view(), newDistinct->view()};
-    auto combined = cudf::concatenate(views, stream, mr);
-    // Deduplicate the combined table
-    std::vector<cudf::size_type> allCols(combined->num_columns());
-    std::iota(allCols.begin(), allCols.end(), 0);
-    seenKeys_ = cudf::distinct(
-        combined->view(), allCols,
-        cudf::duplicate_keep_option::KEEP_FIRST,
-        cudf::null_equality::EQUAL,
-        cudf::nan_equality::ALL_EQUAL,
-        stream, mr);
-  } else {
-    seenKeys_ = std::move(newDistinct);
-  }
 
   // Build output: all input columns + mask column
   std::vector<std::unique_ptr<cudf::column>> outCols;

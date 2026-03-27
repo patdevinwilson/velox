@@ -670,6 +670,45 @@ class LocalExchangeAdapter : public OperatorAdapter {
   }
 };
 
+/// LocalMergeAdapter - Replaces with CudfLocalMerge
+class LocalMergeAdapter : public OperatorAdapter {
+ public:
+  LocalMergeAdapter() : OperatorAdapter("LocalMerge") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::Merge*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    return std::dynamic_pointer_cast<const core::LocalMergeNode>(planNode) !=
+        nullptr;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto mergeNode =
+        std::dynamic_pointer_cast<const core::LocalMergeNode>(planNode);
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfLocalMerge>(operatorId, ctx, mergeNode));
+    return result;
+  }
+};
+
 /// AssignUniqueIdAdapter - Replaces with CudfAssignUniqueId
 class AssignUniqueIdAdapter : public OperatorAdapter {
  public:

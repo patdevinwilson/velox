@@ -136,10 +136,8 @@ RowVectorPtr CudfMarkDistinct::getOutput() {
   // Convert distinctIdx to a column, filter to new-batch range, adjust to
   // local indices, and scatter true values into the mask.
   auto distinctIdxCol = std::make_unique<cudf::column>(
-      cudf::data_type{cudf::type_id::UINT32},
-      distinctIdx->size(),
-      distinctIdx->release(),
-      rmm::device_buffer{},
+      std::move(*distinctIdx),
+      rmm::device_buffer(0, stream, mr),
       0);
 
   // Filter: keep only indices >= seenCount

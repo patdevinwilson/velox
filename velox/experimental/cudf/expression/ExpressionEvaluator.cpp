@@ -255,9 +255,9 @@ class CastFunction : public CudfFunction {
     VELOX_CHECK_EQ(expr->inputs().size(), 1, "cast expects exactly 1 input");
 
     targetCudfType_ =
-        cudf::data_type(cudf_velox::veloxToCudfTypeId(expr->type()));
-    auto sourceType = cudf::data_type(
-        cudf_velox::veloxToCudfTypeId(expr->inputs()[0]->type()));
+        cudf_velox::veloxToCudfDataType(expr->type());
+    auto sourceType =
+        cudf_velox::veloxToCudfDataType(expr->inputs()[0]->type());
     VELOX_CHECK(
         cudf::is_supported_cast(sourceType, targetCudfType_),
         "Cast from {} to {} is not supported",
@@ -383,17 +383,8 @@ class RoundFunction : public CudfFunction {
       std::vector<ColumnOrView>& inputColumns,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
-    auto inputView = asView(inputColumns[0]);
-    if (cudf::is_floating_point(inputView.type())) {
-      return cudf::round(
-          inputView,
-          scale_,
-          cudf::rounding_method::HALF_UP,
-          stream,
-          mr);
-    }
     return cudf::round_decimal(
-        inputView,
+        asView(inputColumns[0]),
         scale_,
         cudf::rounding_method::HALF_UP,
         stream,
@@ -410,7 +401,7 @@ class BinaryFunction : public CudfFunction {
       const std::shared_ptr<velox::exec::Expr>& expr,
       cudf::binary_operator op)
       : op_(op),
-        type_(cudf::data_type(cudf_velox::veloxToCudfTypeId(expr->type()))) {
+        type_(cudf_velox::veloxToCudfDataType(expr->type())) {
     VELOX_CHECK_EQ(
         expr->inputs().size(), 2, "binary function expects exactly 2 inputs");
     if (auto constExpr = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
@@ -1911,7 +1902,7 @@ ColumnOrView FunctionExpression::eval(
     auto result = function_->eval(subexprResults, stream, mr);
     if (finalize) {
       const auto requestedType =
-          cudf::data_type(cudf_velox::veloxToCudfTypeId(expr_->type()));
+          cudf_velox::veloxToCudfDataType(expr_->type());
       auto resultView = asView(result);
       if (resultView.type() != requestedType) {
         return cudf::cast(resultView, requestedType, stream, mr);
@@ -1944,8 +1935,8 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
     if (srcType == nullptr || dstType == nullptr) {
       return false;
     }
-    auto src = cudf::data_type(cudf_velox::veloxToCudfTypeId(srcType));
-    auto dst = cudf::data_type(cudf_velox::veloxToCudfTypeId(dstType));
+    auto src = cudf_velox::veloxToCudfDataType(srcType);
+    auto dst = cudf_velox::veloxToCudfDataType(dstType);
     return cudf::is_supported_cast(src, dst);
   }
 

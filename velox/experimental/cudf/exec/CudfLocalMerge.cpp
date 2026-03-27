@@ -15,10 +15,12 @@
  */
 
 #include "velox/experimental/cudf/exec/CudfLocalMerge.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
 #include "velox/exec/Task.h"
 
+#include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/merge.hpp>
 
 namespace facebook::velox::cudf_velox {

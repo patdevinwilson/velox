@@ -133,10 +133,14 @@ RowVectorPtr CudfMarkDistinct::getOutput() {
   static_cast<cudf::numeric_scalar<bool>&>(*trueScalar)
       .set_value(true, stream);
 
-  // Convert distinctIdx device_uvector to a column for cuDF operations.
-  rmm::device_buffer noNulls(0, stream, mr);
-  auto distinctIdxCol = std::make_unique<cudf::column>(
-      std::move(*distinctIdx), std::move(noNulls), 0);
+  // Convert distinctIdx device_uvector to a cudf::column_view for operations.
+  // We keep the device_uvector alive and create a view over it.
+  auto distinctIdxView = cudf::column_view(
+      cudf::data_type{cudf::type_id::INT32},
+      static_cast<cudf::size_type>(distinctIdx->size()),
+      distinctIdx->data(),
+      nullptr,
+      0);
 
   // Filter: keep only indices >= seenCount
   auto seenCountScalar = cudf::make_numeric_scalar(
@@ -153,12 +157,12 @@ RowVectorPtr CudfMarkDistinct::getOutput() {
 
   // ge_mask: index >= seenCount
   auto geMask = cudf::binary_operation(
-      distinctIdxCol->view(), *seenCountScalar,
+      distinctIdxView, *seenCountScalar,
       cudf::binary_operator::GREATER_EQUAL,
       cudf::data_type{cudf::type_id::BOOL8}, stream, mr);
   // lt_mask: index < seenCount + numRows
   auto ltMask = cudf::binary_operation(
-      distinctIdxCol->view(), *upperBoundScalar,
+      distinctIdxView, *upperBoundScalar,
       cudf::binary_operator::LESS,
       cudf::data_type{cudf::type_id::BOOL8}, stream, mr);
   // combined filter
@@ -169,7 +173,7 @@ RowVectorPtr CudfMarkDistinct::getOutput() {
 
   // Apply filter to get indices in the new batch range
   auto filteredTable = cudf::apply_boolean_mask(
-      cudf::table_view({distinctIdxCol->view()}),
+      cudf::table_view({distinctIdxView}),
       filterMask->view(), stream, mr);
   auto filteredIndices = std::move(filteredTable->release()[0]);
 

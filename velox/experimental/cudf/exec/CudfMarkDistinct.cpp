@@ -133,36 +133,27 @@ RowVectorPtr CudfMarkDistinct::getOutput() {
   static_cast<cudf::numeric_scalar<bool>&>(*trueScalar)
       .set_value(true, stream);
 
-  // Convert distinctIdx device_uvector to a cudf::column_view for operations.
-  // We keep the device_uvector alive and create a view over it.
+  // Build a column_view over the device_uvector for cuDF operations.
   auto distinctIdxView = cudf::column_view(
       cudf::data_type{cudf::type_id::INT32},
       static_cast<cudf::size_type>(distinctIdx->size()),
-      distinctIdx->data(),
+      static_cast<const void*>(distinctIdx->begin()),
       nullptr,
       0);
 
-  // Filter: keep only indices >= seenCount
-  auto seenCountScalar = cudf::make_numeric_scalar(
-      cudf::data_type{cudf::type_id::UINT32}, stream, mr);
-  seenCountScalar->set_valid_async(true, stream);
-  static_cast<cudf::numeric_scalar<uint32_t>&>(*seenCountScalar)
-      .set_value(static_cast<uint32_t>(seenCount), stream);
-
-  auto upperBoundScalar = cudf::make_numeric_scalar(
-      cudf::data_type{cudf::type_id::UINT32}, stream, mr);
-  upperBoundScalar->set_valid_async(true, stream);
-  static_cast<cudf::numeric_scalar<uint32_t>&>(*upperBoundScalar)
-      .set_value(static_cast<uint32_t>(seenCount + numRows), stream);
+  auto seenCountScalar = cudf::numeric_scalar<int32_t>(
+      static_cast<int32_t>(seenCount), true, stream, mr);
+  auto upperBoundScalar = cudf::numeric_scalar<int32_t>(
+      static_cast<int32_t>(seenCount + numRows), true, stream, mr);
 
   // ge_mask: index >= seenCount
   auto geMask = cudf::binary_operation(
-      distinctIdxView, *seenCountScalar,
+      distinctIdxView, seenCountScalar,
       cudf::binary_operator::GREATER_EQUAL,
       cudf::data_type{cudf::type_id::BOOL8}, stream, mr);
   // lt_mask: index < seenCount + numRows
   auto ltMask = cudf::binary_operation(
-      distinctIdxView, *upperBoundScalar,
+      distinctIdxView, upperBoundScalar,
       cudf::binary_operator::LESS,
       cudf::data_type{cudf::type_id::BOOL8}, stream, mr);
   // combined filter
@@ -172,25 +163,27 @@ RowVectorPtr CudfMarkDistinct::getOutput() {
       cudf::data_type{cudf::type_id::BOOL8}, stream, mr);
 
   // Apply filter to get indices in the new batch range
+  std::vector<cudf::column_view> idxCols = {distinctIdxView};
   auto filteredTable = cudf::apply_boolean_mask(
-      cudf::table_view({distinctIdxView}),
+      cudf::table_view(idxCols),
       filterMask->view(), stream, mr);
   auto filteredIndices = std::move(filteredTable->release()[0]);
 
   if (filteredIndices->size() > 0) {
     // Subtract seenCount to get local indices
     auto localIndices = cudf::binary_operation(
-        filteredIndices->view(), *seenCountScalar,
+        filteredIndices->view(), seenCountScalar,
         cudf::binary_operator::SUB,
         cudf::data_type{cudf::type_id::INT32}, stream, mr);
 
     // Scatter true into mask at local indices
     auto scatterTrue = cudf::make_column_from_scalar(
         *trueScalar, localIndices->size(), stream, mr);
-    auto scatterTable = cudf::table_view({scatterTrue->view()});
-    auto targetTable = cudf::table_view({maskCol->view()});
+    std::vector<cudf::column_view> srcCols = {scatterTrue->view()};
+    std::vector<cudf::column_view> tgtCols = {maskCol->view()};
     auto scattered = cudf::scatter(
-        scatterTable, localIndices->view(), targetTable, stream, mr);
+        cudf::table_view(srcCols), localIndices->view(),
+        cudf::table_view(tgtCols), stream, mr);
     maskCol = std::move(scattered->release()[0]);
   }
 

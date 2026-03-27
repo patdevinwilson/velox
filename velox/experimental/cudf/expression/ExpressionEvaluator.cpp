@@ -1600,6 +1600,18 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .constantArgumentType("varchar")
            .build()});
 
+  registerCudfFunctions(
+      {prefix + "greaterthan", prefix + "gt"},
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<BinaryFunction>(
+            expr, cudf::binary_operator::GREATER);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("boolean")
+           .argumentType("double")
+           .argumentType("double")
+           .build()});
+
   registerCudfFunction(
       prefix + "concat",
       [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {

@@ -93,24 +93,12 @@ std::unique_ptr<cudf::scalar> makeScalarFromValue(
   auto stream = cudf::get_default_stream();
   auto mr = cudf::get_current_device_resource_ref();
 
-<<<<<<< HEAD
-  // Scalars are constructed once at init time but later consumed on
-  // an arbitrary per-batch CUDA stream.  The underlying device_buffer
-  // is allocated with cudaMallocAsync on `stream`.  Without a sync
-  // the allocation may still be pending when a different stream reads
-  // the scalar, causing use-before-alloc.  Synchronising here is
-  // cheap (one-time cost per scalar) and guarantees the memory is
-  // available on every stream.
-
-  if constexpr (cudf::is_fixed_width<T>()) {
-=======
   if constexpr (std::is_same_v<T, Timestamp>) {
     using CudfTimestampType = cudf::timestamp_ns;
     auto nanos = isNull ? 0 : value.toNanos();
     return std::make_unique<cudf::timestamp_scalar<CudfTimestampType>>(
         CudfTimestampType{cudf::duration_ns{nanos}}, !isNull, stream, mr);
   } else if constexpr (cudf::is_fixed_width<T>()) {
->>>>>>> mattgara/timestamp-basic
     if (type->isDecimal()) {
       // Velox DECIMAL scale is positive for fractional digits
       // cuDF scale is negative for fractional digits

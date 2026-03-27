@@ -137,7 +137,7 @@ RowVectorPtr CudfMarkDistinct::getOutput() {
   auto distinctIdxView = cudf::column_view(
       cudf::data_type{cudf::type_id::INT32},
       static_cast<cudf::size_type>(distinctIdx->size()),
-      static_cast<const void*>(distinctIdx->begin()),
+      distinctIdx->data(),
       nullptr,
       0);
 
@@ -163,7 +163,8 @@ RowVectorPtr CudfMarkDistinct::getOutput() {
       cudf::data_type{cudf::type_id::BOOL8}, stream, mr);
 
   // Apply filter to get indices in the new batch range
-  std::vector<cudf::column_view> idxCols = {distinctIdxView};
+  std::vector<cudf::column_view> idxCols;
+  idxCols.push_back(distinctIdxView);
   auto filteredTable = cudf::apply_boolean_mask(
       cudf::table_view(idxCols),
       filterMask->view(), stream, mr);
@@ -179,8 +180,10 @@ RowVectorPtr CudfMarkDistinct::getOutput() {
     // Scatter true into mask at local indices
     auto scatterTrue = cudf::make_column_from_scalar(
         *trueScalar, localIndices->size(), stream, mr);
-    std::vector<cudf::column_view> srcCols = {scatterTrue->view()};
-    std::vector<cudf::column_view> tgtCols = {maskCol->view()};
+    std::vector<cudf::column_view> srcCols;
+    srcCols.push_back(scatterTrue->view());
+    std::vector<cudf::column_view> tgtCols;
+    tgtCols.push_back(maskCol->view());
     auto scattered = cudf::scatter(
         cudf::table_view(srcCols), localIndices->view(),
         cudf::table_view(tgtCols), stream, mr);

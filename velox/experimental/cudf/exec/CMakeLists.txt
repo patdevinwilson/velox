@@ -21,6 +21,7 @@ add_library(
   DecimalAggregationKernels.cu
   CudfHashJoin.cpp
   CudfLimit.cpp
+  CudfLocalMerge.cpp
   CudfLocalPartition.cpp
   CudfNestedLoopJoin.cpp
   CudfOrderBy.cpp

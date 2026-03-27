@@ -13,13 +13,24 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#pragma once
 
-#include "velox/type/Type.h"
+#include "velox/experimental/cudf/expression/DecimalUtils.h"
 
-namespace facebook::velox {
+namespace facebook::velox::cudf_velox {
 
-/// Returns the Presto SQL string representation of the given type.
-std::string toPrestoTypeSql(const TypePtr& type);
+bool containsDecimalType(const std::shared_ptr<velox::exec::Expr>& expr) {
+  if (!expr) {
+    return false;
+  }
+  if (expr->type() && expr->type()->isDecimal()) {
+    return true;
+  }
+  for (const auto& input : expr->inputs()) {
+    if (containsDecimalType(input)) {
+      return true;
+    }
+  }
+  return false;
+}
 
-} // namespace facebook::velox
+} // namespace facebook::velox::cudf_velox

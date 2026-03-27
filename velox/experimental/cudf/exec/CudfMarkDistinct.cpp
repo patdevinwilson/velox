@@ -134,12 +134,9 @@ RowVectorPtr CudfMarkDistinct::getOutput() {
       .set_value(true, stream);
 
   // Convert distinctIdx device_uvector to a column for cuDF operations.
+  rmm::device_buffer noNulls(0, stream, mr);
   auto distinctIdxCol = std::make_unique<cudf::column>(
-      cudf::data_type{cudf::type_id::UINT32},
-      static_cast<cudf::size_type>(distinctIdx->size()),
-      distinctIdx->release(),
-      rmm::device_buffer(0, stream, mr),
-      0);
+      std::move(*distinctIdx), std::move(noNulls), 0);
 
   // Filter: keep only indices >= seenCount
   auto seenCountScalar = cudf::make_numeric_scalar(

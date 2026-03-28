@@ -89,8 +89,9 @@ struct CudfConfig {
   /// Enable AST in expression evaluation.
   bool astExpressionEnabled{true};
 
-  /// Enable JIT in expression evaluation.
-  bool jitExpressionEnabled{true};
+  /// Enable JIT in expression evaluation. Disabled by default due to
+  /// Jitify compilation failures on some expressions (TPC-DS Q2,Q34,Q61,Q73).
+  bool jitExpressionEnabled{false};
 
   /// Priority of AST expression. Expression with higher priority is chosen for
   /// a given root expression.

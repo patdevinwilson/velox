@@ -1034,8 +1034,7 @@ void registerAllOperatorAdapters() {
   registry.registerAdapter(std::make_unique<LocalExchangeAdapter>());
   registry.registerAdapter(std::make_unique<LocalMergeAdapter>());
   registry.registerAdapter(std::make_unique<AssignUniqueIdAdapter>());
-  // TODO: Re-enable after fixing correctness (Q87 returns 0 vs 494)
-  // registry.registerAdapter(std::make_unique<MarkDistinctAdapter>());
+  registry.registerAdapter(std::make_unique<MarkDistinctAdapter>());
   registry.registerAdapter(std::make_unique<EnforceSingleRowAdapter>());
   registry.registerAdapter(std::make_unique<ValuesAdapter>());
   registry.registerAdapter(std::make_unique<CallbackSinkAdapter>());

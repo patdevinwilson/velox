@@ -556,7 +556,9 @@ cudf::ast::expression const& AstContext::pushExprToTree(
     } else if (expr->type()->kind() == TypeKind::DOUBLE) {
       return tree.push(Operation{Op::CAST_TO_FLOAT64, op1});
     } else {
-      VELOX_FAIL("Unsupported type for cast operation");
+      VELOX_FAIL(
+          "Unsupported type for cast operation: {}",
+          expr->type()->toString());
     }
   } else if (auto fieldExpr = std::dynamic_pointer_cast<FieldReference>(expr)) {
     // Refer to the appropriate side

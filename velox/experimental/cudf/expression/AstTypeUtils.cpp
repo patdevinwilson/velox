@@ -23,7 +23,8 @@ bool containsAstUnsupportedType(
   if (!expr) {
     return false;
   }
-  if (expr->type() && expr->type()->isTimestamp()) {
+  if (expr->type() &&
+      (expr->type()->isTimestamp() || expr->type()->isDate())) {
     return true;
   }
   for (const auto& input : expr->inputs()) {

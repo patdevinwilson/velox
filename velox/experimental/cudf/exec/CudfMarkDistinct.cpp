@@ -133,13 +133,7 @@ RowVectorPtr CudfMarkDistinct::getOutput() {
   static_cast<cudf::numeric_scalar<bool>&>(*trueScalar)
       .set_value(true, stream);
 
-  // Build a column_view over the device_uvector for cuDF operations.
-  auto distinctIdxView = cudf::column_view(
-      cudf::data_type{cudf::type_id::INT32},
-      static_cast<cudf::size_type>(distinctIdx->size()),
-      distinctIdx->data(),
-      nullptr,
-      0);
+  auto distinctIdxView = distinctIdx->view();
 
   auto seenCountScalar = cudf::numeric_scalar<int32_t>(
       static_cast<int32_t>(seenCount), true, stream, mr);

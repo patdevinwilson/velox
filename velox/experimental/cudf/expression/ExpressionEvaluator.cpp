@@ -334,33 +334,84 @@ class CardinalityFunction : public CudfFunction {
 };
 
 /// subscript(array, index) -- extracts element at 1-based index.
-/// cuDF uses 0-based indexing, so we subtract 1 from the index.
-/// OOB returns null (cuDF behavior) rather than throwing (Presto behavior).
+/// Handles two cases:
+/// 1. Constant array literal + column index: gather from device array
+/// 2. Column array + column index: cudf::lists::extract_list_element
 class SubscriptFunction : public CudfFunction {
  public:
   SubscriptFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
     VELOX_CHECK_EQ(
         expr->inputs().size(), 2, "subscript expects exactly 2 inputs");
+
+    if (auto constExpr = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
+            expr->inputs()[0])) {
+      isConstArray_ = true;
+      auto constValue = constExpr->value();
+      VELOX_CHECK(
+          constValue->type()->isArray(),
+          "subscript first arg must be array");
+      auto arrayVec = constValue->as<ArrayVector>();
+      auto elements = arrayVec->elements()->as<SimpleVector<int32_t>>();
+      auto offset = arrayVec->offsetAt(0);
+      auto size = arrayVec->sizeAt(0);
+      constArrayValues_.reserve(size);
+      for (vector_size_t i = 0; i < size; ++i) {
+        constArrayValues_.push_back(elements->valueAt(offset + i));
+      }
+    }
   }
 
   ColumnOrView eval(
       std::vector<ColumnOrView>& inputColumns,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
+    if (isConstArray_) {
+      // inputColumns[0] is the index (the array literal was skipped)
+      auto indexCol = asView(inputColumns[0]);
+      auto numRows = indexCol.size();
+
+      // Adjust from 1-based (Presto) to 0-based
+      auto oneScalar = cudf::numeric_scalar<int64_t>(1, true, stream, mr);
+      auto adjusted = cudf::binary_operation(
+          indexCol, oneScalar, cudf::binary_operator::SUB,
+          cudf::data_type{cudf::type_id::INT32}, stream, mr);
+
+      // Upload constant array to device
+      auto devArray = cudf::make_numeric_column(
+          cudf::data_type{cudf::type_id::INT32},
+          constArrayValues_.size(),
+          cudf::mask_state::UNALLOCATED, stream, mr);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          devArray->mutable_view().data<int32_t>(),
+          constArrayValues_.data(),
+          constArrayValues_.size() * sizeof(int32_t),
+          cudaMemcpyHostToDevice, stream.value()));
+
+      // Gather: for each row, pick constArray[adjusted_index]
+      auto gatherMap = adjusted->view();
+      std::vector<cudf::column_view> cols;
+      cols.push_back(devArray->view());
+      auto gathered = cudf::gather(
+          cudf::table_view(cols), gatherMap,
+          cudf::out_of_bounds_policy::NULLIFY, stream, mr);
+      return std::move(gathered->release()[0]);
+    }
+
+    // Non-constant array: use lists::extract_list_element
     auto listCol = asView(inputColumns[0]);
     auto indexCol = asView(inputColumns[1]);
-
-    // Adjust from 1-based (Presto) to 0-based (cuDF)
-    auto oneScalar = cudf::numeric_scalar<int32_t>(1, true, stream);
-    auto adjustedIndex = cudf::binary_operation(
+    auto oneScalar = cudf::numeric_scalar<int64_t>(1, true, stream, mr);
+    auto adjusted = cudf::binary_operation(
         indexCol, oneScalar, cudf::binary_operator::SUB,
         cudf::data_type{cudf::type_id::INT32}, stream, mr);
-
     return cudf::lists::extract_list_element(
         cudf::lists_column_view(listCol),
-        adjustedIndex->view(),
-        stream, mr);
+        adjusted->view(), stream, mr);
   }
+
+ private:
+  bool isConstArray_{false};
+  std::vector<int32_t> constArrayValues_;
 };
 
 class RoundFunction : public CudfFunction {
@@ -1389,21 +1440,17 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .argumentType("array(any)")
            .build()});
 
-  // TODO: subscript on constant array literals (e.g. {1,1,0}:ARRAY<INTEGER>)
-  // crashes because constant arrays don't convert to cuDF LIST columns.
-  // Disabled until constant array conversion is supported.
-  // registerCudfFunction(
-  //     prefix + "subscript",
-  //     [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr)
-  //     {
-  //       return std::make_shared<SubscriptFunction>(expr);
-  //     },
-  //     {FunctionSignatureBuilder()
-  //          .typeVariable("T")
-  //          .returnType("T")
-  //          .argumentType("array(T)")
-  //          .argumentType("bigint")
-  //          .build()});
+  registerCudfFunction(
+      prefix + "subscript",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<SubscriptFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .typeVariable("T")
+           .returnType("T")
+           .argumentType("array(T)")
+           .argumentType("bigint")
+           .build()});
 
   registerCudfFunctions(
       {prefix + "substr", prefix + "substring"},

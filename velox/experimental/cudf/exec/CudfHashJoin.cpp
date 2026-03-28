@@ -85,6 +85,13 @@ void CudfHashJoinProbe::close() {
   tree_ = {};
 }
 
+CudaEvent& CudfHashJoinProbe::cudaEvent() {
+  if (!cudaEvent_) {
+    cudaEvent_ = std::make_unique<CudaEvent>(cudaEventDisableTiming);
+  }
+  return *cudaEvent_;
+}
+
 void CudfHashJoinBridge::setHashTable(
     std::optional<CudfHashJoinBridge::hash_type> hashObject) {
   if (CudfConfig::getInstance().debugEnabled) {

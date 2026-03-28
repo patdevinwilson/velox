@@ -1389,17 +1389,21 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .argumentType("array(any)")
            .build()});
 
-  registerCudfFunction(
-      prefix + "subscript",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
-        return std::make_shared<SubscriptFunction>(expr);
-      },
-      {FunctionSignatureBuilder()
-           .typeVariable("T")
-           .returnType("T")
-           .argumentType("array(T)")
-           .argumentType("bigint")
-           .build()});
+  // TODO: subscript on constant array literals (e.g. {1,1,0}:ARRAY<INTEGER>)
+  // crashes because constant arrays don't convert to cuDF LIST columns.
+  // Disabled until constant array conversion is supported.
+  // registerCudfFunction(
+  //     prefix + "subscript",
+  //     [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr)
+  //     {
+  //       return std::make_shared<SubscriptFunction>(expr);
+  //     },
+  //     {FunctionSignatureBuilder()
+  //          .typeVariable("T")
+  //          .returnType("T")
+  //          .argumentType("array(T)")
+  //          .argumentType("bigint")
+  //          .build()});
 
   registerCudfFunctions(
       {prefix + "substr", prefix + "substring"},

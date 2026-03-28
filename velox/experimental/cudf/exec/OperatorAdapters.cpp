@@ -795,9 +795,7 @@ class MarkDistinctAdapter : public OperatorAdapter {
 };
 
 /// EnforceSingleRowAdapter - Pass-through: the CPU operator works with
-/// CudfVector (only checks size() == 1 and buffers). producesGpuOutput
-/// is false because the noMoreInput() path creates a CPU RowVector when
-/// no input was received (all-nulls row).
+/// CudfVector (only checks size() == 1 and buffers).
 class EnforceSingleRowAdapter : public OperatorAdapter {
  public:
   EnforceSingleRowAdapter() : OperatorAdapter("EnforceSingleRow") {}
@@ -818,7 +816,7 @@ class EnforceSingleRowAdapter : public OperatorAdapter {
   }
 
   bool producesGpuOutput() const override {
-    return false;
+    return true;
   }
 
   std::vector<std::unique_ptr<exec::Operator>> createReplacements(

@@ -21,8 +21,10 @@
 
 #include <cudf/aggregation.hpp>
 #include <cudf/concatenate.hpp>
+#include <cudf/copying.hpp>
 #include <cudf/detail/gather.hpp>
 #include <cudf/groupby.hpp>
+#include <cudf/join/join.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/rolling.hpp>
 #include <cudf/sorting.hpp>
@@ -306,6 +308,90 @@ std::unique_ptr<cudf::column> CudfWindow::computeAggregateColumn(
     const std::string& baseName,
     rmm::cuda_stream_view stream) const {
   auto mr = cudf::get_current_device_resource_ref();
+
+  // For full-partition aggregation (UNBOUNDED...UNBOUNDED or
+  // UNBOUNDED...CURRENT ROW with no sort keys), use groupby instead of
+  // rolling window for correctness and performance.
+  bool isUnboundedPreceding =
+      func.frame.startType ==
+      core::WindowNode::BoundType::kUnboundedPreceding;
+  bool isUnboundedFollowing =
+      func.frame.endType ==
+      core::WindowNode::BoundType::kUnboundedFollowing;
+  bool isCurrentRowFollowing =
+      func.frame.endType == core::WindowNode::BoundType::kCurrentRow;
+  bool isFullPartition = isUnboundedPreceding &&
+      (isUnboundedFollowing ||
+       (isCurrentRowFollowing && sortKeyIndices_.empty()));
+
+  if (isFullPartition) {
+    cudf::groupby::groupby gb(partKeys);
+    std::vector<cudf::groupby::aggregation_request> requests(1);
+    requests[0].values = inputCol;
+    if (baseName == "sum") {
+      requests[0].aggregations.push_back(
+          cudf::make_sum_aggregation<cudf::groupby_aggregation>());
+    } else if (baseName == "min") {
+      requests[0].aggregations.push_back(
+          cudf::make_min_aggregation<cudf::groupby_aggregation>());
+    } else if (baseName == "max") {
+      requests[0].aggregations.push_back(
+          cudf::make_max_aggregation<cudf::groupby_aggregation>());
+    } else if (baseName == "count") {
+      requests[0].aggregations.push_back(
+          cudf::make_count_aggregation<cudf::groupby_aggregation>(
+              cudf::null_policy::EXCLUDE));
+    } else {
+      requests[0].aggregations.push_back(
+          cudf::make_mean_aggregation<cudf::groupby_aggregation>());
+    }
+    auto [groupKeys, results] = gb.aggregate(requests, stream, mr);
+
+    // groupby returns one value per group. We need to broadcast it back
+    // to all rows. Use a left join on partition keys.
+    auto groupView = groupKeys->view();
+    std::vector<cudf::size_type> leftOn(partitionKeyIndices_.size());
+    std::vector<cudf::size_type> rightOn(partitionKeyIndices_.size());
+    std::iota(leftOn.begin(), leftOn.end(), 0);
+    std::iota(rightOn.begin(), rightOn.end(), 0);
+
+    // Build a table with group keys + aggregated value
+    auto aggCol = std::move(results[0].results[0]);
+    std::vector<std::unique_ptr<cudf::column>> rightCols;
+    for (cudf::size_type i = 0; i < groupView.num_columns(); ++i) {
+      rightCols.push_back(
+          std::make_unique<cudf::column>(groupView.column(i), stream, mr));
+    }
+    rightCols.push_back(std::move(aggCol));
+    auto rightTable = std::make_unique<cudf::table>(std::move(rightCols));
+    auto rightView = rightTable->view();
+
+    // Left join: partKeys LEFT JOIN rightTable ON all key columns
+    cudf::filtered_join fj(
+        rightView.select(rightOn),
+        cudf::null_equality::EQUAL,
+        cudf::set_as_build_table::RIGHT,
+        stream);
+    auto [leftIdx, rightIdx] =
+        fj.inner_join(partKeys.select(leftOn), stream, mr);
+
+    // Gather the aggregated value column using right indices
+    auto aggValView = rightView.column(rightView.num_columns() - 1);
+    auto rightIdxSpan =
+        cudf::device_span<cudf::size_type const>{*rightIdx};
+    auto rightIdxCol = cudf::column_view{rightIdxSpan};
+    std::vector<cudf::column_view> aggCols;
+    aggCols.push_back(aggValView);
+    auto gathered = cudf::gather(
+        cudf::table_view(aggCols), rightIdxCol,
+        cudf::out_of_bounds_policy::NULLIFY, stream, mr);
+
+    // The gathered result is in join-output order (same as left/input order
+    // for inner join with matching keys). Extract the column.
+    return std::move(gathered->release()[0]);
+  }
+
+  // Falling back to rolling window for non-full-partition frames.
   std::unique_ptr<cudf::rolling_aggregation> agg;
   if (baseName == "sum") {
     agg = cudf::make_sum_aggregation<cudf::rolling_aggregation>();

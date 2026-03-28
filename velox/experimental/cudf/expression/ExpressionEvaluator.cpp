@@ -345,18 +345,24 @@ class SubscriptFunction : public CudfFunction {
 
     if (auto constExpr = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
             expr->inputs()[0])) {
-      isConstArray_ = true;
       auto constValue = constExpr->value();
-      VELOX_CHECK(
-          constValue->type()->isArray(),
-          "subscript first arg must be array");
-      auto arrayVec = constValue->as<ArrayVector>();
-      auto elements = arrayVec->elements()->as<SimpleVector<int32_t>>();
-      auto offset = arrayVec->offsetAt(0);
-      auto size = arrayVec->sizeAt(0);
-      constArrayValues_.reserve(size);
-      for (vector_size_t i = 0; i < size; ++i) {
-        constArrayValues_.push_back(elements->valueAt(offset + i));
+      if (constValue->type()->isArray()) {
+        isConstArray_ = true;
+        // Peel ConstantVector wrapper if present
+        VectorPtr inner = constValue;
+        if (auto cv = inner->as<ConstantVector<ComplexType>>()) {
+          inner = cv->valueVector();
+        }
+        auto arrayVec = inner->as<ArrayVector>();
+        VELOX_CHECK_NOT_NULL(arrayVec, "Expected ArrayVector for subscript");
+        auto elements = arrayVec->elements();
+        auto offset = arrayVec->offsetAt(0);
+        auto size = arrayVec->sizeAt(0);
+        constArrayValues_.reserve(size);
+        auto* intElements = elements->as<SimpleVector<int32_t>>();
+        for (vector_size_t i = 0; i < size; ++i) {
+          constArrayValues_.push_back(intElements->valueAt(offset + i));
+        }
       }
     }
   }
@@ -386,6 +392,7 @@ class SubscriptFunction : public CudfFunction {
           constArrayValues_.data(),
           constArrayValues_.size() * sizeof(int32_t),
           cudaMemcpyHostToDevice, stream.value()));
+      stream.synchronize();
 
       // Gather: for each row, pick constArray[adjusted_index]
       auto gatherMap = adjusted->view();

@@ -228,8 +228,14 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
 
   /** @brief CUDA stream from build operator for synchronization */
   std::optional<rmm::cuda_stream_view> buildStream_;
-  /** @brief CUDA event for coordinating stream synchronization */
+  /** @brief CUDA event for coordinating stream synchronization (lazy init) */
   std::unique_ptr<CudaEvent> cudaEvent_;
+  CudaEvent& cudaEvent() {
+    if (!cudaEvent_) {
+      cudaEvent_ = std::make_unique<CudaEvent>(cudaEventDisableTiming);
+    }
+    return *cudaEvent_;
+  }
 
   // Streaming right join state
   // Per-build-table flags indicating whether a build row has had at least one

@@ -1759,7 +1759,7 @@ RowVectorPtr CudfHashAggregation::getOutput() {
 
 void CudfHashAggregation::noMoreInput() {
   Operator::noMoreInput();
-  if (isPartialOutput_ && inputs_.empty()) {
+  if (isPartialOutput_ && inputs_.empty() && !isGlobal_) {
     finished_ = true;
   }
 }

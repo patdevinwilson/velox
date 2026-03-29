@@ -782,62 +782,73 @@ class SubstrFunction : public CudfFunction {
         expr->inputs().size(), 2, "substr expects at least 2 inputs");
     VELOX_CHECK_LE(expr->inputs().size(), 3, "substr expects at most 3 inputs");
 
-    auto stream = cudf::get_default_stream();
-    auto mr = cudf::get_current_device_resource_ref();
-
     auto startExpr = std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
     VELOX_CHECK_NOT_NULL(startExpr, "substr start must be a constant");
 
-    auto startValue =
-        startExpr->value()->as<SimpleVector<int64_t>>()->valueAt(0);
-    cudf::size_type adjustedStart = static_cast<cudf::size_type>(startValue);
+    auto getIntValue = [](const VectorPtr& vec) -> int64_t {
+      VELOX_CHECK_NOT_NULL(vec, "substr constant value is null");
+      if (auto v64 = vec->as<SimpleVector<int64_t>>()) {
+        return v64->valueAt(0);
+      }
+      if (auto v32 = vec->as<SimpleVector<int32_t>>()) {
+        return static_cast<int64_t>(v32->valueAt(0));
+      }
+      VELOX_FAIL("substr constant must be integer type, got: {}", vec->type()->toString());
+    };
+
+    auto startValue = getIntValue(startExpr->value());
+    adjustedStart_ = static_cast<cudf::size_type>(startValue);
     if (startValue >= 1) {
-      // cuDF indexing starts at 0.
-      // Presto indexing starts at 1.
-      // Positive indices need to substract 1.
-      adjustedStart = static_cast<cudf::size_type>(startValue - 1);
+      adjustedStart_ = static_cast<cudf::size_type>(startValue - 1);
     }
 
-    startScalar_ = std::make_unique<cudf::numeric_scalar<cudf::size_type>>(
-        adjustedStart, true, stream, mr);
-
-    if (expr->inputs().size() > 2) {
+    hasLength_ = expr->inputs().size() > 2;
+    if (hasLength_) {
       auto lengthExpr =
           std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[2]);
       VELOX_CHECK_NOT_NULL(lengthExpr, "substr length must be a constant");
-
-      auto lengthValue =
-          lengthExpr->value()->as<SimpleVector<int64_t>>()->valueAt(0);
-      // cuDF uses indices [begin, end).
-      // Presto uses length as the length of the substring.
-      // We compute the end as start + length.
-      cudf::size_type endPosition =
-          adjustedStart + static_cast<cudf::size_type>(lengthValue);
-
-      endScalar_ = std::make_unique<cudf::numeric_scalar<cudf::size_type>>(
-          endPosition, true, stream, mr);
-    } else {
-      endScalar_ = std::make_unique<cudf::numeric_scalar<cudf::size_type>>(
-          0, false, stream, mr);
+      auto lengthValue = getIntValue(lengthExpr->value());
+      endPosition_ = adjustedStart_ + static_cast<cudf::size_type>(lengthValue);
     }
-
-    stepScalar_ = std::make_unique<cudf::numeric_scalar<cudf::size_type>>(
-        1, true, stream, mr);
   }
 
   ColumnOrView eval(
       std::vector<ColumnOrView>& inputColumns,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
+    ensureScalars(stream, mr);
     auto inputCol = asView(inputColumns[0]);
     return cudf::strings::slice_strings(
         inputCol, *startScalar_, *endScalar_, *stepScalar_, stream, mr);
   }
 
  private:
-  std::unique_ptr<cudf::numeric_scalar<cudf::size_type>> startScalar_;
-  std::unique_ptr<cudf::numeric_scalar<cudf::size_type>> endScalar_;
-  std::unique_ptr<cudf::numeric_scalar<cudf::size_type>> stepScalar_;
+  cudf::size_type adjustedStart_{0};
+  cudf::size_type endPosition_{0};
+  bool hasLength_{false};
+
+  mutable std::unique_ptr<cudf::numeric_scalar<cudf::size_type>> startScalar_;
+  mutable std::unique_ptr<cudf::numeric_scalar<cudf::size_type>> endScalar_;
+  mutable std::unique_ptr<cudf::numeric_scalar<cudf::size_type>> stepScalar_;
+
+  void ensureScalars(
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const {
+    if (startScalar_) {
+      return;
+    }
+    startScalar_ = std::make_unique<cudf::numeric_scalar<cudf::size_type>>(
+        adjustedStart_, true, stream, mr);
+    if (hasLength_) {
+      endScalar_ = std::make_unique<cudf::numeric_scalar<cudf::size_type>>(
+          endPosition_, true, stream, mr);
+    } else {
+      endScalar_ = std::make_unique<cudf::numeric_scalar<cudf::size_type>>(
+          0, false, stream, mr);
+    }
+    stepScalar_ = std::make_unique<cudf::numeric_scalar<cudf::size_type>>(
+        1, true, stream, mr);
+  }
 };
 
 class CoalesceFunction : public CudfFunction {

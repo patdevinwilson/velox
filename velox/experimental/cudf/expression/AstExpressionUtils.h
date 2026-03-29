@@ -596,6 +596,12 @@ cudf::ast::expression const& AstContext::pushExprToTree(
     // Children will be recursively handled by createCudfExpression
     // Determine which side this expression references
     int sideIdx = findExpressionSide(expr);
+    if (sideIdx == -2) {
+      VELOX_FAIL(
+          "Expression references fields from multiple join sides, "
+          "cannot be precomputed: " +
+          name);
+    }
     if (sideIdx < 0) {
       sideIdx = 0; // Default to left side if no fields found
     }
@@ -609,14 +615,20 @@ cudf::ast::expression const& AstContext::pushExprToTree(
 
 int AstContext::findExpressionSide(
     const std::shared_ptr<velox::exec::Expr>& expr) const {
+  int foundSide = -1;
   for (const auto* field : expr->distinctFields()) {
     for (size_t sideIdx = 0; sideIdx < inputRowSchema.size(); ++sideIdx) {
       if (inputRowSchema[sideIdx].get()->containsChild(field->field())) {
-        return static_cast<int>(sideIdx);
+        if (foundSide == -1) {
+          foundSide = static_cast<int>(sideIdx);
+        } else if (foundSide != static_cast<int>(sideIdx)) {
+          return -2; // Fields span multiple sides
+        }
+        break;
       }
     }
   }
-  return -1;
+  return foundSide;
 }
 
 std::vector<ColumnOrView> precomputeSubexpressions(

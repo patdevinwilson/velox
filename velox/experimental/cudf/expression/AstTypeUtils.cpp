@@ -24,7 +24,8 @@ bool containsAstUnsupportedType(
     return false;
   }
   if (expr->type() &&
-      (expr->type()->isTimestamp() || expr->type()->isDate())) {
+      (expr->type()->isTimestamp() || expr->type()->isDate() ||
+       expr->type()->isDecimal())) {
     return true;
   }
   for (const auto& input : expr->inputs()) {

@@ -581,6 +581,15 @@ cudf::ast::expression const& AstContext::pushExprToTree(
         }
       }
     }
+    {
+      std::string schemaInfo = "Schemas: ";
+      for (size_t i = 0; i < inputRowSchema.size(); ++i) {
+        schemaInfo += "[" + std::to_string(i) + "]: " +
+            inputRowSchema[i]->toString() + "; ";
+      }
+      LOG(ERROR) << "Field not found: name=" << name
+                 << " fieldName=" << fieldName << " " << schemaInfo;
+    }
     VELOX_FAIL("Field not found, " + name);
   } else if (!allowPureAstOnly && canBeEvaluatedByCudf(expr, /*deep=*/false)) {
     // Shallow check: only verify this operation is supported

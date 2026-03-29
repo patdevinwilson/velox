@@ -348,16 +348,17 @@ class SubscriptFunction : public CudfFunction {
       auto constValue = constExpr->value();
       if (constValue->type()->isArray()) {
         isConstArray_ = true;
-        // Peel ConstantVector wrapper if present
         VectorPtr inner = constValue;
+        vector_size_t valueIdx = 0;
         if (auto cv = inner->as<ConstantVector<ComplexType>>()) {
+          valueIdx = cv->index();
           inner = cv->valueVector();
         }
         auto arrayVec = inner->as<ArrayVector>();
         VELOX_CHECK_NOT_NULL(arrayVec, "Expected ArrayVector for subscript");
         auto elements = arrayVec->elements();
-        auto offset = arrayVec->offsetAt(0);
-        auto size = arrayVec->sizeAt(0);
+        auto offset = arrayVec->offsetAt(valueIdx);
+        auto size = arrayVec->sizeAt(valueIdx);
         constArrayValues_.reserve(size);
         auto* intElements = elements->as<SimpleVector<int32_t>>();
         for (vector_size_t i = 0; i < size; ++i) {

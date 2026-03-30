@@ -1974,14 +1974,34 @@ ColumnOrView FunctionExpression::eval(
     auto cudfType = cudf_velox::veloxToCudfDataType(expr_->type());
     auto value = constExpr->value();
     if (value->isNullAt(0)) {
-      if (cudfType.id() == cudf::type_id::STRING) {
-        cudf::string_scalar nullStr("", false, stream, mr);
-        return cudf::make_column_from_scalar(nullStr, numRows, stream, mr);
+      std::unique_ptr<cudf::scalar> nullScalar;
+      switch (expr_->type()->kind()) {
+        case TypeKind::BOOLEAN:
+          nullScalar = std::make_unique<cudf::numeric_scalar<bool>>(
+              false, false, stream, mr);
+          break;
+        case TypeKind::INTEGER:
+          nullScalar = std::make_unique<cudf::numeric_scalar<int32_t>>(
+              0, false, stream, mr);
+          break;
+        case TypeKind::BIGINT:
+          nullScalar = std::make_unique<cudf::numeric_scalar<int64_t>>(
+              0, false, stream, mr);
+          break;
+        case TypeKind::DOUBLE:
+          nullScalar = std::make_unique<cudf::numeric_scalar<double>>(
+              0.0, false, stream, mr);
+          break;
+        case TypeKind::VARCHAR:
+          nullScalar =
+              std::make_unique<cudf::string_scalar>("", false, stream, mr);
+          break;
+        default:
+          nullScalar = cudf::make_numeric_scalar(cudfType, stream, mr);
+          nullScalar->set_valid_async(false, stream);
+          break;
       }
-      auto scalar =
-          cudf::make_numeric_scalar(cudfType, stream, mr);
-      scalar->set_valid_async(false, stream);
-      return cudf::make_column_from_scalar(*scalar, numRows, stream, mr);
+      return cudf::make_column_from_scalar(*nullScalar, numRows, stream, mr);
     }
     std::unique_ptr<cudf::scalar> scalar;
     switch (expr_->type()->kind()) {

@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
 #include "velox/core/PlanNode.h"
@@ -63,7 +64,15 @@ CudfNestedLoopJoinBuild::CudfNestedLoopJoinBuild(
 void CudfNestedLoopJoinBuild::addInput(RowVectorPtr input) {
   if (input->size() > 0) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
-    VELOX_CHECK_NOT_NULL(cudfInput, "CudfNestedLoopJoinBuild expects CudfVector");
+    if (!cudfInput) {
+      auto stream = cudfGlobalStreamPool().get_stream();
+      auto tbl = with_arrow::toCudfTable(
+          input, input->pool(), stream,
+          cudf::get_current_device_resource_ref());
+      stream.synchronize();
+      cudfInput = std::make_shared<CudfVector>(
+          pool(), input->type(), input->size(), std::move(tbl), stream);
+    }
     inputs_.push_back(std::move(cudfInput));
   }
 }

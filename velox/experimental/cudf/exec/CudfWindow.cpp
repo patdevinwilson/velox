@@ -225,7 +225,7 @@ CudfWindow::CudfWindow(
     sortOrders_.push_back(
         order.isAscending() ? cudf::order::ASCENDING : cudf::order::DESCENDING);
     nullOrders_.push_back(
-        (order.isNullsFirst() ^ !order.isAscending())
+        order.isNullsFirst()
             ? cudf::null_order::BEFORE
             : cudf::null_order::AFTER);
   }

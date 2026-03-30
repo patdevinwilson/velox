@@ -32,8 +32,10 @@
 #include <cudf/hashing.hpp>
 #include <cudf/lists/count_elements.hpp>
 #include <cudf/lists/extract.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/round.hpp>
 #include <cudf/replace.hpp>
+#include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/round.hpp>
 #include <cudf/strings/attributes.hpp>
 #include <cudf/strings/case.hpp>
@@ -1965,6 +1967,53 @@ ColumnOrView FunctionExpression::eval(
     return inputColumnViews[columnIndex];
   }
 
+  if (auto constExpr =
+          std::dynamic_pointer_cast<velox::exec::ConstantExpr>(expr_)) {
+    cudf::size_type numRows =
+        inputColumnViews.empty() ? 1 : inputColumnViews[0].size();
+    auto cudfType = cudf_velox::veloxToCudfDataType(expr_->type());
+    auto value = constExpr->value();
+    if (value->isNullAt(0)) {
+      if (cudfType.id() == cudf::type_id::STRING) {
+        cudf::string_scalar nullStr("", false, stream, mr);
+        return cudf::make_column_from_scalar(nullStr, numRows, stream, mr);
+      }
+      auto scalar =
+          cudf::make_numeric_scalar(cudfType, stream, mr);
+      scalar->set_valid_async(false, stream);
+      return cudf::make_column_from_scalar(*scalar, numRows, stream, mr);
+    }
+    std::unique_ptr<cudf::scalar> scalar;
+    switch (expr_->type()->kind()) {
+      case TypeKind::BOOLEAN:
+        scalar = std::make_unique<cudf::numeric_scalar<bool>>(
+            value->as<SimpleVector<bool>>()->valueAt(0), true, stream, mr);
+        break;
+      case TypeKind::INTEGER:
+        scalar = std::make_unique<cudf::numeric_scalar<int32_t>>(
+            value->as<SimpleVector<int32_t>>()->valueAt(0), true, stream, mr);
+        break;
+      case TypeKind::BIGINT:
+        scalar = std::make_unique<cudf::numeric_scalar<int64_t>>(
+            value->as<SimpleVector<int64_t>>()->valueAt(0), true, stream, mr);
+        break;
+      case TypeKind::DOUBLE:
+        scalar = std::make_unique<cudf::numeric_scalar<double>>(
+            value->as<SimpleVector<double>>()->valueAt(0), true, stream, mr);
+        break;
+      case TypeKind::VARCHAR:
+        scalar = std::make_unique<cudf::string_scalar>(
+            value->as<SimpleVector<StringView>>()->valueAt(0).str(),
+            true, stream, mr);
+        break;
+      default:
+        scalar = cudf::make_numeric_scalar(cudfType, stream, mr);
+        scalar->set_valid_async(true, stream);
+        break;
+    }
+    return cudf::make_column_from_scalar(*scalar, numRows, stream, mr);
+  }
+
   if (function_) {
     std::vector<ColumnOrView> subexprResults;
     subexprResults.reserve(subexpressions_.size());
@@ -1996,8 +2045,13 @@ void FunctionExpression::close() {
 
 bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
   using velox::exec::FieldReference;
+  using velox::exec::ConstantExpr;
 
   if (std::dynamic_pointer_cast<FieldReference>(expr)) {
+    return true;
+  }
+
+  if (std::dynamic_pointer_cast<velox::exec::ConstantExpr>(expr)) {
     return true;
   }
 

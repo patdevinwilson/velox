@@ -233,8 +233,11 @@ getMetadata(Iterator begin, Iterator end, const std::string& namePrefix) {
   int i = 0;
   for (auto c = begin; c < end; c++) {
     metadata.push_back(cudf::column_metadata(namePrefix + std::to_string(i)));
-    metadata.back().children_meta = getMetadata(
-        c->child_begin(), c->child_end(), namePrefix + std::to_string(i));
+    if (c->type().id() == cudf::type_id::STRUCT ||
+        c->type().id() == cudf::type_id::LIST) {
+      metadata.back().children_meta = getMetadata(
+          c->child_begin(), c->child_end(), namePrefix + std::to_string(i));
+    }
     i++;
   }
   return metadata;

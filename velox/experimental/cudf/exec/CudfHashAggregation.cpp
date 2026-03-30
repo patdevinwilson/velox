@@ -558,7 +558,7 @@ struct CountAggregator : cudf_velox::CudfHashAggregation::Aggregator {
       auto resultScalar = cudf::numeric_scalar<int64_t>(0);
       auto col = cudf::make_column_from_scalar(resultScalar, size, stream);
       const auto cudfOutputType =
-          cudf::data_type(cudf_velox::veloxToCudfTypeId(resultType));
+          cudf_velox::veloxToCudfDataType(resultType);
       if (col->type() != cudfOutputType) {
         col = cudf::cast(*col, cudfOutputType, stream);
       }
@@ -1607,6 +1607,20 @@ void CudfHashAggregation::addInput(RowVectorPtr input) {
   auto cudfInput = std::dynamic_pointer_cast<cudf_velox::CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfInput);
 
+  // Debug: log boolean column null counts for INTERSECT/EXCEPT tracing
+  {
+    auto view = cudfInput->getTableView();
+    for (cudf::size_type ci = 0; ci < view.num_columns(); ++ci) {
+      auto col = view.column(ci);
+      if (col.type().id() == cudf::type_id::BOOL8 && view.num_rows() > 0) {
+        LOG(INFO) << "CudfAgg[" << planNodeId() << "] addInput col " << ci
+                  << ": rows=" << view.num_rows()
+                  << " nulls=" << col.null_count()
+                  << " partial=" << isPartialOutput_;
+      }
+    }
+  }
+
   if (isPartialOutput_ && !isGlobal_ && streamingEnabled_) {
     if (isDistinct_) {
       // Handle partial distinct aggregation.
@@ -1794,7 +1808,7 @@ RowVectorPtr CudfHashAggregation::getOutput() {
           isNullCount ? 0 : countAllRows_);
       auto col = cudf::make_column_from_scalar(resultScalar, 1, stream);
       const auto cudfOutputType =
-          cudf::data_type(veloxToCudfTypeId(outputType_->childAt(i)));
+          cudf_velox::veloxToCudfDataType(outputType_->childAt(i));
       if (col->type() != cudfOutputType) {
         col = cudf::cast(*col, cudfOutputType, stream);
       }

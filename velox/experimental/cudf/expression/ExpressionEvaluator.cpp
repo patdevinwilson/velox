@@ -1581,6 +1581,30 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .build()});
 
   registerCudfFunction(
+      "and",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<LogicalFunction>(
+            expr, cudf::binary_operator::LOGICAL_AND);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("boolean")
+           .argumentType("boolean")
+           .variableArity("boolean")
+           .build()});
+
+  registerCudfFunction(
+      "or",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<LogicalFunction>(
+            expr, cudf::binary_operator::LOGICAL_OR);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("boolean")
+           .argumentType("boolean")
+           .variableArity("boolean")
+           .build()});
+
+  registerCudfFunction(
       prefix + "round",
       [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
         return std::make_shared<RoundFunction>(expr);

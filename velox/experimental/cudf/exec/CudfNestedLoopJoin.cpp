@@ -62,6 +62,9 @@ CudfNestedLoopJoinBuild::CudfNestedLoopJoinBuild(
       joinNode_(joinNode) {}
 
 void CudfNestedLoopJoinBuild::addInput(RowVectorPtr input) {
+  LOG(INFO) << "NLJBuild[" << planNodeId() << "] addInput rows="
+            << input->size() << " isCudf="
+            << (std::dynamic_pointer_cast<CudfVector>(input) != nullptr);
   if (input->size() > 0) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
     if (!cudfInput) {
@@ -267,6 +270,9 @@ RowVectorPtr CudfNestedLoopJoinProbe::getOutput() {
   auto probeView = probeInput->getTableView();
   const cudf::size_type nL = probeView.num_rows();
   const cudf::size_type nR = buildView.num_rows();
+
+  LOG(INFO) << "NLJProbe[" << planNodeId() << "] probe=" << nL
+            << " build=" << nR << " buildVectors=" << buildCudf.size();
 
   input_.reset();
 

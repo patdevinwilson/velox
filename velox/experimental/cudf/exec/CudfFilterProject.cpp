@@ -291,6 +291,17 @@ RowVectorPtr CudfFilterProject::getOutput() {
   stream.synchronize();
   auto const numColumns = outputTable->num_columns();
   auto const size = outputTable->num_rows();
+
+  // Debug: log null counts for boolean columns (Q38/Q87 INTERSECT debug)
+  for (cudf::size_type ci = 0; ci < numColumns; ++ci) {
+    auto col = outputTable->view().column(ci);
+    if (col.type().id() == cudf::type_id::BOOL8 && size > 0) {
+      LOG(INFO) << "CudfFilterProject[" << planNodeId() << "] col " << ci
+                << " (" << outputType_->nameOf(ci) << "): rows=" << size
+                << " nulls=" << col.null_count();
+    }
+  }
+
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(1) << "cudfProject Output: " << size << " rows, " << numColumns
             << " columns";

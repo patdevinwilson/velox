@@ -54,6 +54,7 @@
 #include "velox/exec/TopN.h"
 #include "velox/exec/Values.h"
 #include "velox/exec/Window.h"
+#include "velox/core/Expressions.h"
 
 namespace facebook::velox::cudf_velox {
 
@@ -159,9 +160,10 @@ class FilterProjectAdapter : public OperatorAdapter {
     auto filterNode = filterProjectOp->filterNode();
 
     if (projectPlanNode) {
-      if (projectPlanNode->sources()[0]->outputType()->size() == 0 ||
-          projectPlanNode->outputType()->size() == 0) {
-        return false;
+      if (projectPlanNode->sources()[0]->outputType()->size() == 0) {
+        if (filterNode || !projectPlanNode->projections().empty()) {
+          return false;
+        }
       }
     }
 
@@ -234,9 +236,37 @@ class AggregationAdapter : public OperatorAdapter {
     }
 
     if (aggregationPlanNode->sources()[0]->outputType()->size() == 0) {
-      // We cannot handle RowVectors with a length but no data.
-      // This is the case with count(*) global (without groupby)
-      return false;
+      // Zero-column input is only supported for global count(*)/count(constant).
+      if (!aggregationPlanNode->groupingKeys().empty()) {
+        return false;
+      }
+      if (aggregationPlanNode->aggregates().empty()) {
+        return false;
+      }
+      auto const prefix =
+          cudf_velox::CudfConfig::getInstance().functionNamePrefix;
+      auto isCountAllAggregate =
+          [&](const core::AggregationNode::Aggregate& aggregate) {
+            auto name = aggregate.call->name();
+            if (!prefix.empty() && name.rfind(prefix, 0) == 0) {
+              name = name.substr(prefix.size());
+            }
+            if (!name.starts_with("count")) {
+              return false;
+            }
+            for (const auto& input : aggregate.call->inputs()) {
+              if (dynamic_cast<const core::ConstantTypedExpr*>(input.get()) ==
+                  nullptr) {
+                return false;
+              }
+            }
+            return true;
+          };
+      for (const auto& aggregate : aggregationPlanNode->aggregates()) {
+        if (!isCountAllAggregate(aggregate)) {
+          return false;
+        }
+      }
     }
 
     return canBeEvaluatedByCudf(

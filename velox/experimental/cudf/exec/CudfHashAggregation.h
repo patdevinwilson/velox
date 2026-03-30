@@ -145,6 +145,10 @@ class CudfHashAggregation : public exec::Operator, public NvtxHelper {
   const bool isSingleStep_;
   // Streaming aggregation is disabled if companion aggregates are present.
   bool streamingEnabled_{true};
+  // Global count(*) with no input columns. Track row counts separately.
+  bool countAllGlobalNoInput_{false};
+  int64_t countAllRows_{0};
+  std::vector<bool> countConstantNulls_;
 
   // Maximum memory usage for partial aggregation.
   const int64_t maxPartialAggregationMemoryUsage_;

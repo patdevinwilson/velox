@@ -18,6 +18,7 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
 #include "velox/experimental/cudf/exec/CudfAssignUniqueId.h"
 #include "velox/experimental/cudf/exec/CudfBatchConcat.h"
+#include "velox/experimental/cudf/exec/CudfEnforceSingleRow.h"
 #include "velox/experimental/cudf/exec/CudfFilterProject.h"
 #include "velox/experimental/cudf/exec/CudfHashAggregation.h"
 #include "velox/experimental/cudf/exec/CudfHashJoin.h"
@@ -37,6 +38,7 @@
 #include "velox/exec/EnforceSingleRow.h"
 #include "velox/exec/MarkDistinct.h"
 #include "velox/exec/CallbackSink.h"
+#include "velox/exec/EnforceSingleRow.h"
 #include "velox/exec/FilterProject.h"
 #include "velox/exec/HashAggregation.h"
 #include "velox/exec/HashBuild.h"
@@ -824,39 +826,6 @@ class MarkDistinctAdapter : public OperatorAdapter {
   }
 };
 
-/// EnforceSingleRowAdapter - Pass-through: the CPU operator works with
-/// CudfVector (only checks size() == 1 and buffers).
-class EnforceSingleRowAdapter : public OperatorAdapter {
- public:
-  EnforceSingleRowAdapter() : OperatorAdapter("EnforceSingleRow") {}
-
-  bool canHandle(const exec::Operator* op) const override {
-    return dynamic_cast<const exec::EnforceSingleRow*>(op) != nullptr;
-  }
-
-  bool canRunOnGPU(
-      const exec::Operator* /*op*/,
-      const core::PlanNodePtr& /*planNode*/,
-      exec::DriverCtx* /*ctx*/) const override {
-    return true;
-  }
-
-  bool acceptsGpuInput() const override {
-    return true;
-  }
-
-  bool producesGpuOutput() const override {
-    return true;
-  }
-
-  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
-      const exec::Operator* /*op*/,
-      const core::PlanNodePtr& /*planNode*/,
-      exec::DriverCtx* /*ctx*/,
-      int32_t /*operatorId*/) const override {
-    return {};
-  }
-};
 
 class ValuesAdapter : public OperatorAdapter {
  public:
@@ -891,6 +860,50 @@ class ValuesAdapter : public OperatorAdapter {
 
   bool keepOperator() const override {
     return true;
+  }
+};
+
+/// EnforceSingleRowAdapter - Replaces with CudfEnforceSingleRow
+class EnforceSingleRowAdapter : public OperatorAdapter {
+ public:
+  EnforceSingleRowAdapter() : OperatorAdapter("EnforceSingleRow") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::EnforceSingleRow*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /*ctx*/) const override {
+    // Check if GPU EnforceSingleRow is enabled in config
+    if (!CudfConfig::getInstance().enableEnforceSingleRow) {
+      return false;
+    }
+    return std::dynamic_pointer_cast<const core::EnforceSingleRowNode>(
+               planNode) != nullptr;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto enforceSingleRowPlanNode =
+        std::dynamic_pointer_cast<const core::EnforceSingleRowNode>(planNode);
+
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(std::make_unique<CudfEnforceSingleRow>(
+        operatorId, ctx, enforceSingleRowPlanNode));
+    return result;
   }
 };
 

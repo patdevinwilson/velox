@@ -1997,6 +1997,8 @@ ColumnOrView FunctionExpression::eval(
         inputColumnViews.empty() ? 1 : inputColumnViews[0].size();
     auto cudfType = cudf_velox::veloxToCudfDataType(expr_->type());
     auto value = constExpr->value();
+    LOG(WARNING) << "ConstantExpr eval: type=" << expr_->type()->toString()
+                 << " isNull=" << value->isNullAt(0) << " rows=" << numRows;
     if (value->isNullAt(0)) {
       std::unique_ptr<cudf::scalar> nullScalar;
       switch (expr_->type()->kind()) {

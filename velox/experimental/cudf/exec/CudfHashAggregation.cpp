@@ -555,12 +555,14 @@ struct CountAggregator : cudf_velox::CudfHashAggregation::Aggregator {
       const auto size =
           results[outputIdx_].results[0] ? results[outputIdx_].results[0]->size()
                                          : 0;
-      auto resultScalar = cudf::numeric_scalar<int64_t>(0);
-      auto col = cudf::make_column_from_scalar(resultScalar, size, stream);
+      auto resultScalar = cudf::numeric_scalar<int64_t>(
+          0, true, stream, get_output_mr());
+      auto col = cudf::make_column_from_scalar(
+          resultScalar, size, stream, get_output_mr());
       const auto cudfOutputType =
           cudf_velox::veloxToCudfDataType(resultType);
       if (col->type() != cudfOutputType) {
-        col = cudf::cast(*col, cudfOutputType, stream);
+        col = cudf::cast(*col, cudfOutputType, stream, get_output_mr());
       }
       return col;
     }
@@ -1805,12 +1807,13 @@ RowVectorPtr CudfHashAggregation::getOutput() {
       const bool isNullCount =
           i < countConstantNulls_.size() && countConstantNulls_[i];
       auto resultScalar = cudf::numeric_scalar<int64_t>(
-          isNullCount ? 0 : countAllRows_);
-      auto col = cudf::make_column_from_scalar(resultScalar, 1, stream);
+          isNullCount ? 0 : countAllRows_, true, stream, get_output_mr());
+      auto col = cudf::make_column_from_scalar(
+          resultScalar, 1, stream, get_output_mr());
       const auto cudfOutputType =
           cudf_velox::veloxToCudfDataType(outputType_->childAt(i));
       if (col->type() != cudfOutputType) {
-        col = cudf::cast(*col, cudfOutputType, stream);
+        col = cudf::cast(*col, cudfOutputType, stream, get_output_mr());
       }
       resultColumns.push_back(std::move(col));
     }

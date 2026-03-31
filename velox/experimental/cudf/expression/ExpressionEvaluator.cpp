@@ -1985,6 +1985,11 @@ ColumnOrView FunctionExpression::eval(
     bool finalize) {
   using velox::exec::FieldReference;
 
+  if (expr_->name() == "literal") {
+    LOG(WARNING) << "FunctionExpression::eval for LITERAL expr="
+                 << expr_->toString() << " type=" << expr_->type()->toString();
+  }
+
   if (auto fieldExpr = std::dynamic_pointer_cast<FieldReference>(expr_)) {
     auto name = fieldExpr->name();
     auto columnIndex = inputRowSchema_->getChildIdx(name);
@@ -2205,6 +2210,15 @@ std::shared_ptr<CudfExpression> createCudfExpression(
         best = &entry;
       }
     }
+  }
+
+  if (expr->name() == "literal") {
+    LOG(WARNING) << "createCudfExpression for LITERAL: type="
+                 << expr->type()->toString()
+                 << " best=" << (best ? "found" : "none")
+                 << " isConstantExpr="
+                 << (std::dynamic_pointer_cast<velox::exec::ConstantExpr>(expr)
+                         != nullptr);
   }
 
   if (best != nullptr) {

@@ -26,7 +26,10 @@
 #include "velox/expression/FieldReference.h"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/column/column_factories.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/unary.hpp>
 
@@ -174,8 +177,15 @@ void CudfFilterProject::initialize() {
       bool identityProjection = checkAddIdentityProjection(
           projection, inputType, i, identityProjections_);
       if (!identityProjection) {
-        allExprs.push_back(projection);
-        resultProjections_.emplace_back(allExprs.size() - 1, i);
+        if (auto constExpr =
+                dynamic_cast<const core::ConstantTypedExpr*>(
+                    projection.get())) {
+          constantProjections_.emplace_back(
+              constExpr->toConstantVector(operatorCtx_->pool()), i);
+        } else {
+          allExprs.push_back(projection);
+          resultProjections_.emplace_back(allExprs.size() - 1, i);
+        }
       }
     }
   } else {
@@ -194,6 +204,12 @@ void CudfFilterProject::initialize() {
 
   const auto inputType = project_ ? project_->sources()[0]->outputType()
                                   : filter_->sources()[0]->outputType();
+
+  LOG(WARNING) << "CudfFilterProject[" << planNodeId()
+               << "] init: identityProjections=" << identityProjections_.size()
+               << " resultProjections=" << resultProjections_.size()
+               << " allExprs=" << expr->exprs().size()
+               << " outputCols=" << outputType_->size();
 
   // convert to AST
   if (CudfConfig::getInstance().debugEnabled) {
@@ -362,6 +378,9 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
     inputViews.push_back(col->view());
   }
   std::vector<ColumnOrView> columns;
+  LOG(WARNING) << "CudfFilterProject[" << planNodeId() << "] project: "
+               << projectEvaluators_.size() << " evaluators, "
+               << inputViews.size() << " inputCols";
   for (auto& projectEvaluator : projectEvaluators_) {
     columns.push_back(
         projectEvaluator->eval(inputViews, stream, get_output_mr(), true));
@@ -370,7 +389,7 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
   // Rearrange columns to match outputType_
   std::vector<std::unique_ptr<cudf::column>> outputColumns(outputType_->size());
   // computed resultProjections
-  for (int i = 0; i < resultProjections_.size(); i++) {
+  for (int i = 0; i < resultProjections_.size() && i < columns.size(); i++) {
     auto& columnOrView = columns[i];
     if (std::holds_alternative<std::unique_ptr<cudf::column>>(columnOrView)) {
       // Move the owned column
@@ -405,6 +424,55 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
     }
     VELOX_CHECK_GT(inputChannelCount[identity.inputChannel], 0);
     inputChannelCount[identity.inputChannel]--;
+  }
+
+  // Handle constant projections (ExprSet folds these away, so we create
+  // the cudf columns directly from the Velox constant values)
+  auto mr = get_output_mr();
+  for (const auto& cp : constantProjections_) {
+    cudf::size_type numRows =
+        inputTableColumns.empty() ? 0 : inputTableColumns[0]->size();
+    if (numRows == 0 || !cp.value) {
+      continue;
+    }
+    auto cudfType = cudf_velox::veloxToCudfDataType(cp.value->type());
+    if (cp.value->isNullAt(0)) {
+      std::unique_ptr<cudf::scalar> nullScalar;
+      if (cudfType.id() == cudf::type_id::STRING) {
+        nullScalar =
+            std::make_unique<cudf::string_scalar>("", false, stream, mr);
+      } else {
+        nullScalar = std::make_unique<cudf::numeric_scalar<int64_t>>(
+            0, false, stream, mr);
+        auto col =
+            cudf::make_column_from_scalar(*nullScalar, numRows, stream, mr);
+        if (col->type() != cudfType) {
+          col = cudf::cast(*col, cudfType, stream, mr);
+        }
+        outputColumns[cp.outputChannel] = std::move(col);
+        continue;
+      }
+      outputColumns[cp.outputChannel] =
+          cudf::make_column_from_scalar(*nullScalar, numRows, stream, mr);
+    } else {
+      std::unique_ptr<cudf::scalar> scalar;
+      switch (cp.value->type()->kind()) {
+        case TypeKind::BOOLEAN:
+          scalar = std::make_unique<cudf::numeric_scalar<bool>>(
+              cp.value->as<SimpleVector<bool>>()->valueAt(0),
+              true, stream, mr);
+          break;
+        default:
+          scalar = std::make_unique<cudf::numeric_scalar<int64_t>>(
+              0, true, stream, mr);
+          break;
+      }
+      auto col = cudf::make_column_from_scalar(*scalar, numRows, stream, mr);
+      if (col->type() != cudfType) {
+        col = cudf::cast(*col, cudfType, stream, mr);
+      }
+      outputColumns[cp.outputChannel] = std::move(col);
+    }
   }
 
   return outputColumns;

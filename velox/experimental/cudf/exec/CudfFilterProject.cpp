@@ -177,12 +177,6 @@ void CudfFilterProject::initialize() {
       bool identityProjection = checkAddIdentityProjection(
           projection, inputType, i, identityProjections_);
       if (!identityProjection) {
-        auto constExpr = dynamic_cast<const core::ConstantTypedExpr*>(
-            projection.get());
-        if (constExpr) {
-          constantProjections_.emplace_back(
-              constExpr->toConstantVector(operatorCtx_->pool()), i);
-        }
         allExprs.push_back(projection);
         resultProjections_.emplace_back(allExprs.size() - 1, i);
       }
@@ -204,11 +198,6 @@ void CudfFilterProject::initialize() {
   const auto inputType = project_ ? project_->sources()[0]->outputType()
                                   : filter_->sources()[0]->outputType();
 
-  LOG(WARNING) << "CudfFilterProject[" << planNodeId()
-               << "] init: identityProjections=" << identityProjections_.size()
-               << " resultProjections=" << resultProjections_.size()
-               << " allExprs=" << expr->exprs().size()
-               << " outputCols=" << outputType_->size();
 
   // convert to AST
   if (CudfConfig::getInstance().debugEnabled) {
@@ -311,9 +300,6 @@ RowVectorPtr CudfFilterProject::getOutput() {
   for (cudf::size_type ci = 0; ci < numColumns; ++ci) {
     auto col = outputTable->view().column(ci);
     if (col.type().id() == cudf::type_id::BOOL8 && size > 0) {
-      LOG(INFO) << "CudfFilterProject[" << planNodeId() << "] col " << ci
-                << " (" << outputType_->nameOf(ci) << "): rows=" << size
-                << " nulls=" << col.null_count();
     }
   }
 
@@ -377,134 +363,3 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
     inputViews.push_back(col->view());
   }
   std::vector<ColumnOrView> columns;
-  LOG(WARNING) << "CudfFilterProject[" << planNodeId() << "] project: "
-               << projectEvaluators_.size() << " evaluators, "
-               << inputViews.size() << " inputCols";
-  for (auto& projectEvaluator : projectEvaluators_) {
-    columns.push_back(
-        projectEvaluator->eval(inputViews, stream, get_output_mr(), true));
-  }
-
-  // Rearrange columns to match outputType_
-  std::vector<std::unique_ptr<cudf::column>> outputColumns(outputType_->size());
-  // computed resultProjections
-  for (int i = 0; i < resultProjections_.size() && i < columns.size(); i++) {
-    auto& columnOrView = columns[i];
-    if (std::holds_alternative<std::unique_ptr<cudf::column>>(columnOrView)) {
-      // Move the owned column
-      outputColumns[resultProjections_[i].outputChannel] =
-          std::move(std::get<std::unique_ptr<cudf::column>>(columnOrView));
-    } else {
-      // Materialize the column_view into an owned column
-      auto view = std::get<cudf::column_view>(columnOrView);
-      outputColumns[resultProjections_[i].outputChannel] =
-          std::make_unique<cudf::column>(view, stream, get_output_mr());
-    }
-  }
-
-  // Count occurrences of each inputChannel, and move columns if they occur only
-  // once
-  std::unordered_map<column_index_t, int> inputChannelCount;
-  for (const auto& identity : identityProjections_) {
-    inputChannelCount[identity.inputChannel]++;
-  }
-
-  // identityProjections (input to output copy)
-  for (auto const& identity : identityProjections_) {
-    VELOX_CHECK_NOT_NULL(inputTableColumns[identity.inputChannel]);
-    if (inputChannelCount[identity.inputChannel] == 1) {
-      // Move the column if it occurs only once
-      outputColumns[identity.outputChannel] =
-          std::move(inputTableColumns[identity.inputChannel]);
-    } else {
-      // Otherwise, copy the column and decrement the count
-      outputColumns[identity.outputChannel] = std::make_unique<cudf::column>(
-          *inputTableColumns[identity.inputChannel], stream, get_output_mr());
-    }
-    VELOX_CHECK_GT(inputChannelCount[identity.inputChannel], 0);
-    inputChannelCount[identity.inputChannel]--;
-  }
-
-  // Handle constant projections (ExprSet folds these away, so we create
-  // the cudf columns directly from the Velox constant values)
-  auto mr = get_output_mr();
-  for (const auto& cp : constantProjections_) {
-    cudf::size_type numRows =
-        inputTableColumns.empty() ? 0 : inputTableColumns[0]->size();
-    if (numRows == 0 || !cp.value) {
-      continue;
-    }
-    auto cudfType = cudf_velox::veloxToCudfDataType(cp.value->type());
-    std::unique_ptr<cudf::scalar> scalar;
-    bool isNull = cp.value->isNullAt(0);
-    switch (cp.value->type()->kind()) {
-      case TypeKind::BOOLEAN:
-        scalar = std::make_unique<cudf::numeric_scalar<bool>>(
-            isNull ? false
-                   : cp.value->as<SimpleVector<bool>>()->valueAt(0),
-            !isNull, stream, mr);
-        break;
-      case TypeKind::INTEGER:
-        scalar = std::make_unique<cudf::numeric_scalar<int32_t>>(
-            isNull ? 0
-                   : cp.value->as<SimpleVector<int32_t>>()->valueAt(0),
-            !isNull, stream, mr);
-        break;
-      case TypeKind::BIGINT:
-        scalar = std::make_unique<cudf::numeric_scalar<int64_t>>(
-            isNull ? 0
-                   : cp.value->as<SimpleVector<int64_t>>()->valueAt(0),
-            !isNull, stream, mr);
-        break;
-      case TypeKind::DOUBLE:
-        scalar = std::make_unique<cudf::numeric_scalar<double>>(
-            isNull ? 0.0
-                   : cp.value->as<SimpleVector<double>>()->valueAt(0),
-            !isNull, stream, mr);
-        break;
-      case TypeKind::VARCHAR:
-        scalar = std::make_unique<cudf::string_scalar>(
-            isNull ? ""
-                   : cp.value->as<SimpleVector<StringView>>()->valueAt(0).str(),
-            !isNull, stream, mr);
-        break;
-      case TypeKind::REAL:
-        scalar = std::make_unique<cudf::numeric_scalar<float>>(
-            isNull ? 0.0f
-                   : cp.value->as<SimpleVector<float>>()->valueAt(0),
-            !isNull, stream, mr);
-        break;
-      case TypeKind::SMALLINT:
-        scalar = std::make_unique<cudf::numeric_scalar<int16_t>>(
-            isNull ? static_cast<int16_t>(0)
-                   : cp.value->as<SimpleVector<int16_t>>()->valueAt(0),
-            !isNull, stream, mr);
-        break;
-      case TypeKind::TINYINT:
-        scalar = std::make_unique<cudf::numeric_scalar<int8_t>>(
-            isNull ? static_cast<int8_t>(0)
-                   : cp.value->as<SimpleVector<int8_t>>()->valueAt(0),
-            !isNull, stream, mr);
-        break;
-      default:
-        // For unsupported types (DECIMAL, TIMESTAMP, etc.), skip and let
-        // the output slot remain nullptr — the evaluator or identity
-        // projection path will handle it, or it was folded by ExprSet.
-        continue;
-    }
-    outputColumns[cp.outputChannel] =
-        cudf::make_column_from_scalar(*scalar, numRows, stream, mr);
-  }
-
-  return outputColumns;
-}
-
-bool CudfFilterProject::allInputProcessed() {
-  return !input_;
-}
-
-bool CudfFilterProject::isFinished() {
-  return noMoreInput_ && allInputProcessed();
-}
-
-} // namespace facebook::velox::cudf_velox

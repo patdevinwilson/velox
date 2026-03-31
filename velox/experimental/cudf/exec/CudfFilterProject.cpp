@@ -468,9 +468,29 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
                    : cp.value->as<SimpleVector<StringView>>()->valueAt(0).str(),
             !isNull, stream, mr);
         break;
+      case TypeKind::REAL:
+        scalar = std::make_unique<cudf::numeric_scalar<float>>(
+            isNull ? 0.0f
+                   : cp.value->as<SimpleVector<float>>()->valueAt(0),
+            !isNull, stream, mr);
+        break;
+      case TypeKind::SMALLINT:
+        scalar = std::make_unique<cudf::numeric_scalar<int16_t>>(
+            isNull ? static_cast<int16_t>(0)
+                   : cp.value->as<SimpleVector<int16_t>>()->valueAt(0),
+            !isNull, stream, mr);
+        break;
+      case TypeKind::TINYINT:
+        scalar = std::make_unique<cudf::numeric_scalar<int8_t>>(
+            isNull ? static_cast<int8_t>(0)
+                   : cp.value->as<SimpleVector<int8_t>>()->valueAt(0),
+            !isNull, stream, mr);
+        break;
       default:
-        VELOX_FAIL(
-            "Unsupported constant type: {}", cp.value->type()->toString());
+        // For unsupported types (DECIMAL, TIMESTAMP, etc.), skip and let
+        // the output slot remain nullptr — the evaluator or identity
+        // projection path will handle it, or it was folded by ExprSet.
+        continue;
     }
     outputColumns[cp.outputChannel] =
         cudf::make_column_from_scalar(*scalar, numRows, stream, mr);

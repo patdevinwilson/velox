@@ -581,8 +581,7 @@ struct CountAggregator : cudf_velox::CudfHashAggregation::Aggregator {
   }
 
   bool isCountAll() const {
-    return !isConstantNull() &&
-        (constant != nullptr || inputIndex == kConstantChannel);
+    return !isConstantNull() && constant != nullptr;
   }
 
   uint32_t outputIdx_;
@@ -1207,11 +1206,7 @@ AggregationInputChannels buildAggregationInputChannels(
 
     VELOX_CHECK(aggInputs.size() <= 1);
     if (aggInputs.empty()) {
-      if (isCountFunctionName(aggregate.call->name())) {
-        aggInputs.push_back(kConstantChannel);
-      } else {
-        aggInputs.push_back(fallbackChannel);
-      }
+      aggInputs.push_back(fallbackChannel);
     }
 
     if (aggregate.distinct) {

@@ -177,15 +177,14 @@ void CudfFilterProject::initialize() {
       bool identityProjection = checkAddIdentityProjection(
           projection, inputType, i, identityProjections_);
       if (!identityProjection) {
-        if (auto constExpr =
-                dynamic_cast<const core::ConstantTypedExpr*>(
-                    projection.get())) {
+        auto constExpr = dynamic_cast<const core::ConstantTypedExpr*>(
+            projection.get());
+        if (constExpr) {
           constantProjections_.emplace_back(
               constExpr->toConstantVector(operatorCtx_->pool()), i);
-        } else {
-          allExprs.push_back(projection);
-          resultProjections_.emplace_back(allExprs.size() - 1, i);
         }
+        allExprs.push_back(projection);
+        resultProjections_.emplace_back(allExprs.size() - 1, i);
       }
     }
   } else {

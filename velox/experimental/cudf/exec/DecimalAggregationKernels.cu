@@ -324,7 +324,15 @@ std::unique_ptr<cudf::column> serializeDecimalSumState(
     auto charsPtr = reinterpret_cast<uint8_t*>(charsBuf.data());
     if (useLargeOffsets) {
       auto offsetsPtr = offsetsView.data<int64_t>();
-      if (sumCol.type().id() == cudf::type_id::DECIMAL64) {
+      if (sumCol.type().id() == cudf::type_id::DECIMAL32) {
+        packStateKernel<int32_t, int64_t>
+            <<<gridSize, blockSize, 0, stream.value()>>>(
+                sumCol.data<int32_t>(),
+                countCol.data<int64_t>(),
+                offsetsPtr,
+                charsPtr,
+                numRows);
+      } else if (sumCol.type().id() == cudf::type_id::DECIMAL64) {
         packStateKernel<int64_t, int64_t>
             <<<gridSize, blockSize, 0, stream.value()>>>(
                 sumCol.data<int64_t>(),
@@ -346,7 +354,15 @@ std::unique_ptr<cudf::column> serializeDecimalSumState(
       }
     } else {
       auto offsetsPtr = offsetsView.data<int32_t>();
-      if (sumCol.type().id() == cudf::type_id::DECIMAL64) {
+      if (sumCol.type().id() == cudf::type_id::DECIMAL32) {
+        packStateKernel<int32_t, int32_t>
+            <<<gridSize, blockSize, 0, stream.value()>>>(
+                sumCol.data<int32_t>(),
+                countCol.data<int64_t>(),
+                offsetsPtr,
+                charsPtr,
+                numRows);
+      } else if (sumCol.type().id() == cudf::type_id::DECIMAL64) {
         packStateKernel<int64_t, int32_t>
             <<<gridSize, blockSize, 0, stream.value()>>>(
                 sumCol.data<int64_t>(),

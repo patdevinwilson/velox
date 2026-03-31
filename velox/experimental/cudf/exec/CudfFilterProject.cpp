@@ -436,43 +436,45 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
       continue;
     }
     auto cudfType = cudf_velox::veloxToCudfDataType(cp.value->type());
-    if (cp.value->isNullAt(0)) {
-      std::unique_ptr<cudf::scalar> nullScalar;
-      if (cudfType.id() == cudf::type_id::STRING) {
-        nullScalar =
-            std::make_unique<cudf::string_scalar>("", false, stream, mr);
-      } else {
-        nullScalar = std::make_unique<cudf::numeric_scalar<int64_t>>(
-            0, false, stream, mr);
-        auto col =
-            cudf::make_column_from_scalar(*nullScalar, numRows, stream, mr);
-        if (col->type() != cudfType) {
-          col = cudf::cast(*col, cudfType, stream, mr);
-        }
-        outputColumns[cp.outputChannel] = std::move(col);
-        continue;
-      }
-      outputColumns[cp.outputChannel] =
-          cudf::make_column_from_scalar(*nullScalar, numRows, stream, mr);
-    } else {
-      std::unique_ptr<cudf::scalar> scalar;
-      switch (cp.value->type()->kind()) {
-        case TypeKind::BOOLEAN:
-          scalar = std::make_unique<cudf::numeric_scalar<bool>>(
-              cp.value->as<SimpleVector<bool>>()->valueAt(0),
-              true, stream, mr);
-          break;
-        default:
-          scalar = std::make_unique<cudf::numeric_scalar<int64_t>>(
-              0, true, stream, mr);
-          break;
-      }
-      auto col = cudf::make_column_from_scalar(*scalar, numRows, stream, mr);
-      if (col->type() != cudfType) {
-        col = cudf::cast(*col, cudfType, stream, mr);
-      }
-      outputColumns[cp.outputChannel] = std::move(col);
+    std::unique_ptr<cudf::scalar> scalar;
+    bool isNull = cp.value->isNullAt(0);
+    switch (cp.value->type()->kind()) {
+      case TypeKind::BOOLEAN:
+        scalar = std::make_unique<cudf::numeric_scalar<bool>>(
+            isNull ? false
+                   : cp.value->as<SimpleVector<bool>>()->valueAt(0),
+            !isNull, stream, mr);
+        break;
+      case TypeKind::INTEGER:
+        scalar = std::make_unique<cudf::numeric_scalar<int32_t>>(
+            isNull ? 0
+                   : cp.value->as<SimpleVector<int32_t>>()->valueAt(0),
+            !isNull, stream, mr);
+        break;
+      case TypeKind::BIGINT:
+        scalar = std::make_unique<cudf::numeric_scalar<int64_t>>(
+            isNull ? 0
+                   : cp.value->as<SimpleVector<int64_t>>()->valueAt(0),
+            !isNull, stream, mr);
+        break;
+      case TypeKind::DOUBLE:
+        scalar = std::make_unique<cudf::numeric_scalar<double>>(
+            isNull ? 0.0
+                   : cp.value->as<SimpleVector<double>>()->valueAt(0),
+            !isNull, stream, mr);
+        break;
+      case TypeKind::VARCHAR:
+        scalar = std::make_unique<cudf::string_scalar>(
+            isNull ? ""
+                   : cp.value->as<SimpleVector<StringView>>()->valueAt(0).str(),
+            !isNull, stream, mr);
+        break;
+      default:
+        VELOX_FAIL(
+            "Unsupported constant type: {}", cp.value->type()->toString());
     }
+    outputColumns[cp.outputChannel] =
+        cudf::make_column_from_scalar(*scalar, numRows, stream, mr);
   }
 
   return outputColumns;

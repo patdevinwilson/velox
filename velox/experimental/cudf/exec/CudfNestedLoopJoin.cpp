@@ -23,6 +23,9 @@
 #include "velox/core/PlanNode.h"
 #include "velox/exec/NestedLoopJoinBuild.h"
 #include "velox/exec/Task.h"
+#include "velox/expression/Expr.h"
+
+#include <cudf/stream_compaction.hpp>
 
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -322,6 +325,38 @@ RowVectorPtr CudfNestedLoopJoinProbe::getOutput() {
   }
 
   auto outTable = std::make_unique<cudf::table>(std::move(outCols));
+
+  // Apply join filter condition if present
+  if (joinNode_->joinCondition()) {
+    if (!filterEvaluator_) {
+      auto probeType = asRowType(joinNode_->sources()[0]->outputType());
+      auto buildType = asRowType(joinNode_->sources()[1]->outputType());
+      filterConcatType_ = facebook::velox::type::concatRowTypes(
+          std::vector<velox::RowTypePtr>{probeType, buildType});
+      exec::ExprSet exprs(
+          {joinNode_->joinCondition()}, operatorCtx_->execCtx());
+      VELOX_CHECK_EQ(exprs.exprs().size(), 1);
+      filterEvaluator_ =
+          createCudfExpression(exprs.exprs()[0], filterConcatType_);
+    }
+
+    // Build column views: all probe cols + all build cols for filter eval
+    std::vector<cudf::column_view> allColViews;
+    auto leftView = leftGathered->view();
+    auto rightView = rightGathered->view();
+    for (cudf::size_type i = 0; i < leftView.num_columns(); i++) {
+      allColViews.push_back(leftView.column(i));
+    }
+    for (cudf::size_type i = 0; i < rightView.num_columns(); i++) {
+      allColViews.push_back(rightView.column(i));
+    }
+
+    auto filterResult = filterEvaluator_->eval(allColViews, stream, mr);
+    auto filterView = asView(filterResult);
+    auto filtered = cudf::apply_boolean_mask(
+        outTable->view(), filterView, stream, mr);
+    outTable = std::move(filtered);
+  }
 
   return std::make_shared<CudfVector>(
       pool(),

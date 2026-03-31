@@ -17,6 +17,7 @@
 #pragma once
 
 #include "velox/experimental/cudf/exec/NvtxHelper.h"
+#include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
 #include "velox/core/PlanNode.h"
@@ -87,10 +88,9 @@ class CudfNestedLoopJoinProbe : public exec::Operator, public NvtxHelper {
 
   bool isFinished() override;
 
-  /// Only cross join (no filter) with inner join type is supported on GPU.
+  /// Inner join (with or without filter condition) is supported on GPU.
   static bool isSupported(const core::NestedLoopJoinNode* node) {
-    return node->joinCondition() == nullptr &&
-        node->joinType() == core::JoinType::kInner;
+    return node->joinType() == core::JoinType::kInner;
   }
 
  private:
@@ -103,6 +103,10 @@ class CudfNestedLoopJoinProbe : public exec::Operator, public NvtxHelper {
   /// Cached concatenated build table (computed once in getBuildData)
   std::unique_ptr<cudf::table> concatenatedBuildTable_;
   cudf::table_view buildView_;
+
+  /// Filter evaluator for join condition (lazy init)
+  std::shared_ptr<CudfExpression> filterEvaluator_;
+  RowTypePtr filterConcatType_;
 
   /// Output column order: which columns come from probe vs build (by output
   /// index).

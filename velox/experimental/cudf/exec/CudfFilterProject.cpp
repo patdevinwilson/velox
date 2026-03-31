@@ -363,3 +363,53 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
     inputViews.push_back(col->view());
   }
   std::vector<ColumnOrView> columns;
+  for (auto& projectEvaluator : projectEvaluators_) {
+    columns.push_back(
+        projectEvaluator->eval(inputViews, stream, get_output_mr(), true));
+  }
+
+  // Rearrange columns to match outputType_
+  std::vector<std::unique_ptr<cudf::column>> outputColumns(outputType_->size());
+  // computed resultProjections
+  for (int i = 0; i < resultProjections_.size(); i++) {
+    auto& columnOrView = columns[i];
+    if (std::holds_alternative<std::unique_ptr<cudf::column>>(columnOrView)) {
+      outputColumns[resultProjections_[i].outputChannel] =
+          std::move(std::get<std::unique_ptr<cudf::column>>(columnOrView));
+    } else {
+      auto view = std::get<cudf::column_view>(columnOrView);
+      outputColumns[resultProjections_[i].outputChannel] =
+          std::make_unique<cudf::column>(view, stream, get_output_mr());
+    }
+  }
+
+  std::unordered_map<column_index_t, int> inputChannelCount;
+  for (const auto& identity : identityProjections_) {
+    inputChannelCount[identity.inputChannel]++;
+  }
+
+  for (auto const& identity : identityProjections_) {
+    VELOX_CHECK_NOT_NULL(inputTableColumns[identity.inputChannel]);
+    if (inputChannelCount[identity.inputChannel] == 1) {
+      outputColumns[identity.outputChannel] =
+          std::move(inputTableColumns[identity.inputChannel]);
+    } else {
+      outputColumns[identity.outputChannel] = std::make_unique<cudf::column>(
+          *inputTableColumns[identity.inputChannel], stream, get_output_mr());
+    }
+    VELOX_CHECK_GT(inputChannelCount[identity.inputChannel], 0);
+    inputChannelCount[identity.inputChannel]--;
+  }
+
+  return outputColumns;
+}
+
+bool CudfFilterProject::allInputProcessed() {
+  return !input_;
+}
+
+bool CudfFilterProject::isFinished() {
+  return noMoreInput_ && allInputProcessed();
+}
+
+} // namespace facebook::velox::cudf_velox

@@ -80,8 +80,12 @@ void CudfOrderBy::noMoreInput() {
 
   auto stream = cudfGlobalStreamPool().get_stream();
   // Using the output memory resource to allow spilling to CPU memory.
-  auto tbl = getConcatenatedTable(
-      std::exchange(inputs_, {}), outputType_, stream, get_output_mr());
+  auto tbl =
+      getConcatenatedTable(inputs_, outputType_, stream, get_output_mr());
+
+  // Release input data after synchronizing
+  stream.synchronize();
+  inputs_.clear();
 
   VELOX_CHECK_NOT_NULL(tbl);
 

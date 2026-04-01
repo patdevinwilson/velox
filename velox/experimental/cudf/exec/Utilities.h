@@ -26,33 +26,20 @@
 
 namespace facebook::velox::cudf_velox {
 
+[[nodiscard]] std::unique_ptr<cudf::table> makeEmptyTable(
+    TypePtr const& inputType);
+
 // Concatenate a vector of cuDF tables into a single table
 [[nodiscard]] std::unique_ptr<cudf::table> concatenateTables(
     std::vector<std::unique_ptr<cudf::table>> tables,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);
 
-/**
- * @brief Concatenates multiple CudfVectors into a single cudf::table.
- *
- * This function concatenates a vector of CudfVectors into a single cudf::table.
- * It handles stream synchronization by joining all input streams on the
- * provided output stream before concatenation. After concatenation, input
- * streams wait for the output stream to ensure safe deallocation.
- *
- * The input tables are consumed and deallocated when the function returns.
- * If the input vector is empty, returns an empty table matching tableType.
- *
- * @param tables Input vector of CudfVectors to concatenate (consumed during
- * operation)
- * @param tableType Velox type representation for creating empty tables when
- * needed
- * @param stream CUDA stream for concatenation and memory management
- * @param mr Memory resource for output allocation
- * @return Single concatenated table
- */
+// Concatenate a vector of cuDF tables into a single table.
+// This function joins the streams owned by individual tables on the passed
+// stream. Inputs are not safe to use after calling this function.
 [[nodiscard]] std::unique_ptr<cudf::table> getConcatenatedTable(
-    std::vector<CudfVectorPtr>&& tables,
+    std::vector<CudfVectorPtr>& tables,
     const TypePtr& tableType,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);
@@ -71,8 +58,7 @@ namespace facebook::velox::cudf_velox {
  * The function is stream-safe and handles proper stream synchronization. All
  * input streams from individual tables are collected and joined on the provided
  * output stream. Tables that may have been created on different CUDA streams
- * are also properly synchronized. The input tables are consumed and deallocated
- * after synchronization.
+ * are also properly synchronized.
  *
  * @param tables Input vector of CUDF tables to concatenate (consumed during
  * operation)
@@ -85,7 +71,7 @@ namespace facebook::velox::cudf_velox {
  */
 [[nodiscard]] std::vector<std::unique_ptr<cudf::table>>
 getConcatenatedTableBatched(
-    std::vector<CudfVectorPtr>&& tables,
+    std::vector<CudfVectorPtr>& tables,
     const TypePtr& tableType,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);

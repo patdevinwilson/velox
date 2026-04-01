@@ -16,105 +16,44 @@
 #include "velox/experimental/cudf/exec/Validation.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/AstUtils.h"
-#include "velox/experimental/cudf/expression/DecimalExpressionKernels.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
-#include "velox/common/base/Exceptions.h"
 #include "velox/expression/ConstantExpr.h"
 #include "velox/expression/FieldReference.h"
 #include "velox/expression/FunctionSignature.h"
 #include "velox/expression/SignatureBinder.h"
-#include "velox/type/DecimalUtil.h"
 #include "velox/type/Type.h"
 #include "velox/vector/BaseVector.h"
 
-#include <cudf/aggregation.hpp>
 #include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/datetime.hpp>
-#include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/hashing.hpp>
 #include <cudf/lists/count_elements.hpp>
-#include <cudf/reduction.hpp>
-#include <cudf/replace.hpp>
+#include <cudf/lists/extract.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/round.hpp>
-#include <cudf/scalar/scalar.hpp>
+#include <cudf/replace.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
+#include <cudf/round.hpp>
 #include <cudf/strings/attributes.hpp>
 #include <cudf/strings/case.hpp>
-#include <cudf/strings/combine.hpp>
 #include <cudf/strings/contains.hpp>
+#include <cudf/strings/convert/convert_datetime.hpp>
+#include <cudf/strings/convert/convert_integers.hpp>
 #include <cudf/strings/find.hpp>
 #include <cudf/strings/slice.hpp>
 #include <cudf/strings/split/split.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/transform.hpp>
-#include <cudf/types.hpp>
 #include <cudf/unary.hpp>
-#include <cudf/utilities/traits.hpp>
+
+#include <cctype>
 
 namespace facebook::velox::cudf_velox {
 namespace {
-
-bool decimalScalarIsZero(
-    const cudf::scalar& scalar,
-    rmm::cuda_stream_view stream) {
-  if (!scalar.is_valid(stream)) {
-    return false;
-  }
-  if (scalar.type().id() == cudf::type_id::DECIMAL64) {
-    auto const& dec =
-        static_cast<cudf::fixed_point_scalar<numeric::decimal64> const&>(
-            scalar);
-    return dec.value(stream) == 0;
-  }
-  if (scalar.type().id() == cudf::type_id::DECIMAL128) {
-    auto const& dec =
-        static_cast<cudf::fixed_point_scalar<numeric::decimal128> const&>(
-            scalar);
-    return dec.value(stream) == 0;
-  }
-  return false;
-}
-
-bool hasDecimalZero(
-    const cudf::column_view& col,
-    rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr) {
-  if (col.is_empty()) {
-    return false;
-  }
-  std::unique_ptr<cudf::scalar> zero;
-  auto scale = numeric::scale_type{col.type().scale()};
-  if (col.type().id() == cudf::type_id::DECIMAL64) {
-    zero =
-        cudf::make_fixed_point_scalar<numeric::decimal64>(0, scale, stream, mr);
-  } else if (col.type().id() == cudf::type_id::DECIMAL128) {
-    zero = cudf::make_fixed_point_scalar<numeric::decimal128>(
-        0, scale, stream, mr);
-  } else {
-    return false;
-  }
-
-  auto equals = cudf::binary_operation(
-      col,
-      *zero,
-      cudf::binary_operator::EQUAL,
-      cudf::data_type{cudf::type_id::BOOL8},
-      stream,
-      mr);
-  auto anyAgg = cudf::make_any_aggregation<cudf::reduce_aggregation>();
-  auto anyScalar = cudf::reduce(
-      equals->view(),
-      *anyAgg,
-      cudf::data_type{cudf::type_id::BOOL8},
-      stream,
-      mr);
-  auto const& boolScalar =
-      static_cast<cudf::numeric_scalar<bool> const&>(*anyScalar);
-  return boolScalar.is_valid(stream) && boolScalar.value(stream);
-}
 
 struct CudfExpressionEvaluatorEntry {
   int priority;
@@ -209,6 +148,69 @@ static bool matchCallAgainstSignatures(
   return false;
 }
 
+bool endsWith(const std::string& value, const std::string& suffix) {
+  return value.size() >= suffix.size() &&
+      value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+std::string normalizeDateTruncUnit(std::string unit) {
+  if (unit.size() >= 2 && unit.front() == '\'' && unit.back() == '\'') {
+    unit = unit.substr(1, unit.size() - 2);
+  }
+  for (auto& ch : unit) {
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  }
+  return unit;
+}
+
+enum class DateTruncUnit {
+  kSecond,
+  kMinute,
+  kHour,
+  kDay,
+  kWeek,
+  kMonth,
+  kQuarter,
+  kYear
+};
+
+DateTruncUnit
+parseDateTruncUnit(const std::string& unit, bool isTimestamp, bool isDate) {
+  if (unit == "second") {
+    VELOX_CHECK(isTimestamp, "date_trunc second requires timestamp input");
+    return DateTruncUnit::kSecond;
+  }
+  if (unit == "minute") {
+    VELOX_CHECK(isTimestamp, "date_trunc minute requires timestamp input");
+    return DateTruncUnit::kMinute;
+  }
+  if (unit == "hour") {
+    VELOX_CHECK(isTimestamp, "date_trunc hour requires timestamp input");
+    return DateTruncUnit::kHour;
+  }
+  if (unit == "day") {
+    return DateTruncUnit::kDay;
+  }
+  if (unit == "week") {
+    return DateTruncUnit::kWeek;
+  }
+  if (unit == "month") {
+    return DateTruncUnit::kMonth;
+  }
+  if (unit == "quarter") {
+    return DateTruncUnit::kQuarter;
+  }
+  if (unit == "year") {
+    return DateTruncUnit::kYear;
+  }
+  VELOX_CHECK(
+      false,
+      "date_trunc does not support unit '{}' for {} input",
+      unit,
+      isTimestamp ? "timestamp" : (isDate ? "date" : "unknown"));
+  return DateTruncUnit::kDay;
+}
+
 } // namespace
 
 class SplitFunction : public CudfFunction {
@@ -216,10 +218,14 @@ class SplitFunction : public CudfFunction {
   SplitFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
     using velox::exec::ConstantExpr;
 
+    auto stream = cudf::get_default_stream();
+    auto mr = cudf::get_current_device_resource_ref();
+
     auto delimiterExpr =
         std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
     VELOX_CHECK_NOT_NULL(delimiterExpr, "split delimiter must be a constant");
-    delimiter_ = delimiterExpr->value()->toString(0);
+    delimiterScalar_ = std::make_unique<cudf::string_scalar>(
+        delimiterExpr->value()->toString(0), true, stream, mr);
 
     auto limitExpr =
         std::dynamic_pointer_cast<velox::exec::ConstantExpr>(expr->inputs()[2]);
@@ -236,13 +242,12 @@ class SplitFunction : public CudfFunction {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     auto inputCol = asView(inputColumns[0]);
-    cudf::string_scalar delimiterScalar(delimiter_, true, stream, mr);
     return cudf::strings::split_record(
-        inputCol, delimiterScalar, maxSplitCount_, stream, mr);
+        inputCol, *delimiterScalar_, maxSplitCount_, stream, mr);
   };
 
  private:
-  std::string delimiter_;
+  std::unique_ptr<cudf::string_scalar> delimiterScalar_;
   cudf::size_type maxSplitCount_;
 };
 
@@ -251,7 +256,8 @@ class CastFunction : public CudfFunction {
   CastFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
     VELOX_CHECK_EQ(expr->inputs().size(), 1, "cast expects exactly 1 input");
 
-    targetCudfType_ = cudf_velox::veloxToCudfDataType(expr->type());
+    targetCudfType_ =
+        cudf_velox::veloxToCudfDataType(expr->type());
     auto sourceType =
         cudf_velox::veloxToCudfDataType(expr->inputs()[0]->type());
     VELOX_CHECK(
@@ -329,6 +335,95 @@ class CardinalityFunction : public CudfFunction {
   }
 };
 
+/// subscript(array, index) -- extracts element at 1-based index.
+/// Handles two cases:
+/// 1. Constant array literal + column index: gather from device array
+/// 2. Column array + column index: cudf::lists::extract_list_element
+class SubscriptFunction : public CudfFunction {
+ public:
+  SubscriptFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(), 2, "subscript expects exactly 2 inputs");
+
+    if (auto constExpr = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
+            expr->inputs()[0])) {
+      auto constValue = constExpr->value();
+      if (constValue->type()->isArray()) {
+        isConstArray_ = true;
+        VectorPtr inner = constValue;
+        vector_size_t valueIdx = 0;
+        if (auto cv = inner->as<ConstantVector<ComplexType>>()) {
+          valueIdx = cv->index();
+          inner = cv->valueVector();
+        }
+        auto arrayVec = inner->as<ArrayVector>();
+        VELOX_CHECK_NOT_NULL(arrayVec, "Expected ArrayVector for subscript");
+        auto elements = arrayVec->elements();
+        auto offset = arrayVec->offsetAt(valueIdx);
+        auto size = arrayVec->sizeAt(valueIdx);
+        constArrayValues_.reserve(size);
+        auto* intElements = elements->as<SimpleVector<int32_t>>();
+        for (vector_size_t i = 0; i < size; ++i) {
+          constArrayValues_.push_back(intElements->valueAt(offset + i));
+        }
+      }
+    }
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    if (isConstArray_) {
+      // inputColumns[0] is the index (the array literal was skipped)
+      auto indexCol = asView(inputColumns[0]);
+      auto numRows = indexCol.size();
+
+      // Adjust from 1-based (Presto) to 0-based
+      auto oneScalar = cudf::numeric_scalar<int64_t>(1, true, stream, mr);
+      auto adjusted = cudf::binary_operation(
+          indexCol, oneScalar, cudf::binary_operator::SUB,
+          cudf::data_type{cudf::type_id::INT32}, stream, mr);
+
+      // Upload constant array to device
+      auto devArray = cudf::make_numeric_column(
+          cudf::data_type{cudf::type_id::INT32},
+          constArrayValues_.size(),
+          cudf::mask_state::UNALLOCATED, stream, mr);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          devArray->mutable_view().data<int32_t>(),
+          constArrayValues_.data(),
+          constArrayValues_.size() * sizeof(int32_t),
+          cudaMemcpyHostToDevice, stream.value()));
+      stream.synchronize();
+
+      // Gather: for each row, pick constArray[adjusted_index]
+      auto gatherMap = adjusted->view();
+      std::vector<cudf::column_view> cols;
+      cols.push_back(devArray->view());
+      auto gathered = cudf::gather(
+          cudf::table_view(cols), gatherMap,
+          cudf::out_of_bounds_policy::NULLIFY, stream, mr);
+      return std::move(gathered->release()[0]);
+    }
+
+    // Non-constant array: use lists::extract_list_element
+    auto listCol = asView(inputColumns[0]);
+    auto indexCol = asView(inputColumns[1]);
+    auto oneScalar = cudf::numeric_scalar<int64_t>(1, true, stream, mr);
+    auto adjusted = cudf::binary_operation(
+        indexCol, oneScalar, cudf::binary_operator::SUB,
+        cudf::data_type{cudf::type_id::INT32}, stream, mr);
+    return cudf::lists::extract_list_element(
+        cudf::lists_column_view(listCol),
+        adjusted->view(), stream, mr);
+  }
+
+ private:
+  bool isConstArray_{false};
+  std::vector<int32_t> constArrayValues_;
+};
+
 class RoundFunction : public CudfFunction {
  public:
   explicit RoundFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
@@ -349,13 +444,16 @@ class RoundFunction : public CudfFunction {
       std::vector<ColumnOrView>& inputColumns,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
+    auto inputView = asView(inputColumns[0]);
+    if (cudf::is_floating_point(inputView.type())) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+      return cudf::round(
+          inputView, scale_, cudf::rounding_method::HALF_UP, stream, mr);
+#pragma GCC diagnostic pop
+    }
     return cudf::round_decimal(
-        asView(inputColumns[0]),
-        scale_,
-        cudf::rounding_method::HALF_UP,
-        stream,
-        mr);
-    ;
+        inputView, scale_, cudf::rounding_method::HALF_UP, stream, mr);
   }
 
  private:
@@ -367,9 +465,10 @@ class BinaryFunction : public CudfFunction {
   BinaryFunction(
       const std::shared_ptr<velox::exec::Expr>& expr,
       cudf::binary_operator op)
-      : op_(op), type_(cudf_velox::veloxToCudfDataType(expr->type())) {
+      : op_(op),
+        type_(cudf_velox::veloxToCudfDataType(expr->type())) {
     VELOX_CHECK_EQ(
-        expr->inputs().size(), 2, "Binary function expects exactly 2 inputs");
+        expr->inputs().size(), 2, "binary function expects exactly 2 inputs");
     if (auto constExpr = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
             expr->inputs()[0])) {
       auto constValue = constExpr->value();
@@ -385,323 +484,27 @@ class BinaryFunction : public CudfFunction {
 
     VELOX_CHECK(
         !(left_ != nullptr && right_ != nullptr),
-        "Binary function on two literals is not supported");
+        "Not support both left and right are literals");
   }
 
   ColumnOrView eval(
       std::vector<ColumnOrView>& inputColumns,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
-    auto isComparisonOp = [](cudf::binary_operator op) {
-      switch (op) {
-        case cudf::binary_operator::EQUAL:
-        case cudf::binary_operator::NOT_EQUAL:
-        case cudf::binary_operator::GREATER:
-        case cudf::binary_operator::GREATER_EQUAL:
-        case cudf::binary_operator::LESS:
-        case cudf::binary_operator::LESS_EQUAL:
-          return true;
-        default:
-          return false;
-      }
-    };
     if (left_ == nullptr && right_ == nullptr) {
-      if (op_ == cudf::binary_operator::DIV && cudf::is_fixed_point(type_)) {
-        auto lhsView = asView(inputColumns[0]);
-        auto rhsView = asView(inputColumns[1]);
-        std::unique_ptr<cudf::column> lhsCast;
-        std::unique_ptr<cudf::column> rhsCast;
-        if (type_.id() == cudf::type_id::DECIMAL128) {
-          if (lhsView.type().id() == cudf::type_id::DECIMAL64) {
-            auto castType = cudf::data_type{
-                cudf::type_id::DECIMAL128, lhsView.type().scale()};
-            lhsCast = cudf::cast(lhsView, castType, stream, mr);
-            lhsView = lhsCast->view();
-          }
-          if (rhsView.type().id() == cudf::type_id::DECIMAL64) {
-            auto castType = cudf::data_type{
-                cudf::type_id::DECIMAL128, rhsView.type().scale()};
-            rhsCast = cudf::cast(rhsView, castType, stream, mr);
-            rhsView = rhsCast->view();
-          }
-        }
-        if (hasDecimalZero(rhsView, stream, mr)) {
-          VELOX_USER_FAIL("Division by zero");
-        }
-        auto lhsScale = -lhsView.type().scale();
-        auto rhsScale = -rhsView.type().scale();
-        auto outScale = -type_.scale();
-        auto aRescale = outScale - lhsScale + rhsScale;
-        return decimalDivide(lhsView, rhsView, type_, aRescale, stream);
-      }
-      auto lhsView = asView(inputColumns[0]);
-      auto rhsView = asView(inputColumns[1]);
-      if (isComparisonOp(op_) && cudf::is_fixed_point(lhsView.type()) &&
-          cudf::is_fixed_point(rhsView.type())) {
-        auto lhsScale = -lhsView.type().scale();
-        auto rhsScale = -rhsView.type().scale();
-        auto targetScale = lhsScale > rhsScale ? lhsScale : rhsScale;
-        auto targetTypeId = (lhsView.type().id() == cudf::type_id::DECIMAL128 ||
-                             rhsView.type().id() == cudf::type_id::DECIMAL128)
-            ? cudf::type_id::DECIMAL128
-            : cudf::type_id::DECIMAL64;
-        auto targetType =
-            cudf::data_type{targetTypeId, numeric::scale_type{-targetScale}};
-        std::unique_ptr<cudf::column> lhsCast;
-        std::unique_ptr<cudf::column> rhsCast;
-        if (lhsView.type() != targetType) {
-          lhsCast = cudf::cast(lhsView, targetType, stream, mr);
-          lhsView = lhsCast->view();
-        }
-        if (rhsView.type() != targetType) {
-          rhsCast = cudf::cast(rhsView, targetType, stream, mr);
-          rhsView = rhsCast->view();
-        }
-        // @TODO Check for divide-by-zero as in the DECIMAL case above?
-        return cudf::binary_operation(lhsView, rhsView, op_, type_, stream, mr);
-      }
-      if (cudf::is_fixed_point(type_)) {
-        if (op_ == cudf::binary_operator::ADD ||
-            op_ == cudf::binary_operator::SUB ||
-            op_ == cudf::binary_operator::MOD) {
-          std::unique_ptr<cudf::column> lhsCast;
-          std::unique_ptr<cudf::column> rhsCast;
-          if (lhsView.type() != type_) {
-            lhsCast = cudf::cast(lhsView, type_, stream, mr);
-            lhsView = lhsCast->view();
-          }
-          if (rhsView.type() != type_) {
-            rhsCast = cudf::cast(rhsView, type_, stream, mr);
-            rhsView = rhsCast->view();
-          }
-          // @TODO Check for divide-by-zero as in the DECIMAL case above?
-          return cudf::binary_operation(
-              lhsView, rhsView, op_, type_, stream, mr);
-        }
-        if (op_ == cudf::binary_operator::MUL) {
-          std::unique_ptr<cudf::column> lhsCast;
-          std::unique_ptr<cudf::column> rhsCast;
-          if (type_.id() == cudf::type_id::DECIMAL128) {
-            if (lhsView.type().id() == cudf::type_id::DECIMAL64) {
-              auto castType = cudf::data_type{
-                  cudf::type_id::DECIMAL128, lhsView.type().scale()};
-              lhsCast = cudf::cast(lhsView, castType, stream, mr);
-              lhsView = lhsCast->view();
-            }
-            if (rhsView.type().id() == cudf::type_id::DECIMAL64) {
-              auto castType = cudf::data_type{
-                  cudf::type_id::DECIMAL128, rhsView.type().scale()};
-              rhsCast = cudf::cast(rhsView, castType, stream, mr);
-              rhsView = rhsCast->view();
-            }
-          }
-          // @TODO Check for divide-by-zero as in the DECIMAL case above?
-          return cudf::binary_operation(
-              lhsView, rhsView, op_, type_, stream, mr);
-        }
-      }
-      // @TODO Check for divide-by-zero as in the DECIMAL case above?
-      return cudf::binary_operation(lhsView, rhsView, op_, type_, stream, mr);
+      return cudf::binary_operation(
+          asView(inputColumns[0]),
+          asView(inputColumns[1]),
+          op_,
+          type_,
+          stream,
+          mr);
     } else if (left_ == nullptr) {
-      if (op_ == cudf::binary_operator::DIV && cudf::is_fixed_point(type_)) {
-        if (decimalScalarIsZero(*right_, stream)) {
-          VELOX_USER_FAIL("Division by zero");
-        }
-        auto lhsView = asView(inputColumns[0]);
-        auto lhsScale = -lhsView.type().scale();
-        auto rhsScale = -right_->type().scale();
-        auto outScale = -type_.scale();
-        auto aRescale = outScale - lhsScale + rhsScale;
-        auto rhsCol =
-            cudf::make_column_from_scalar(*right_, lhsView.size(), stream, mr);
-        auto rhsView = rhsCol->view();
-        std::unique_ptr<cudf::column> lhsCast;
-        std::unique_ptr<cudf::column> rhsCast;
-        if (type_.id() == cudf::type_id::DECIMAL128) {
-          if (lhsView.type().id() == cudf::type_id::DECIMAL64) {
-            auto castType = cudf::data_type{
-                cudf::type_id::DECIMAL128, lhsView.type().scale()};
-            lhsCast = cudf::cast(lhsView, castType, stream, mr);
-            lhsView = lhsCast->view();
-          }
-          if (rhsView.type().id() == cudf::type_id::DECIMAL64) {
-            auto castType = cudf::data_type{
-                cudf::type_id::DECIMAL128, rhsView.type().scale()};
-            rhsCast = cudf::cast(rhsView, castType, stream, mr);
-            rhsView = rhsCast->view();
-          }
-        }
-        return decimalDivide(lhsView, rhsView, type_, aRescale, stream);
-      }
-      auto lhsView = asView(inputColumns[0]);
-      if (isComparisonOp(op_) && cudf::is_fixed_point(lhsView.type()) &&
-          cudf::is_fixed_point(right_->type())) {
-        auto rhsCol =
-            cudf::make_column_from_scalar(*right_, lhsView.size(), stream, mr);
-        auto rhsView = rhsCol->view();
-        auto lhsScale = -lhsView.type().scale();
-        auto rhsScale = -rhsView.type().scale();
-        auto targetScale = lhsScale > rhsScale ? lhsScale : rhsScale;
-        auto targetTypeId = (lhsView.type().id() == cudf::type_id::DECIMAL128 ||
-                             rhsView.type().id() == cudf::type_id::DECIMAL128)
-            ? cudf::type_id::DECIMAL128
-            : cudf::type_id::DECIMAL64;
-        auto targetType =
-            cudf::data_type{targetTypeId, numeric::scale_type{-targetScale}};
-        std::unique_ptr<cudf::column> lhsCast;
-        std::unique_ptr<cudf::column> rhsCast;
-        if (lhsView.type() != targetType) {
-          lhsCast = cudf::cast(lhsView, targetType, stream, mr);
-          lhsView = lhsCast->view();
-        }
-        if (rhsView.type() != targetType) {
-          rhsCast = cudf::cast(rhsView, targetType, stream, mr);
-          rhsView = rhsCast->view();
-        }
-        return cudf::binary_operation(lhsView, rhsView, op_, type_, stream, mr);
-      }
-      if (cudf::is_fixed_point(type_)) {
-        auto rhsCol =
-            cudf::make_column_from_scalar(*right_, lhsView.size(), stream, mr);
-        auto rhsView = rhsCol->view();
-        if (op_ == cudf::binary_operator::ADD ||
-            op_ == cudf::binary_operator::SUB ||
-            op_ == cudf::binary_operator::MOD) {
-          std::unique_ptr<cudf::column> lhsCast;
-          std::unique_ptr<cudf::column> rhsCast;
-          if (lhsView.type() != type_) {
-            lhsCast = cudf::cast(lhsView, type_, stream, mr);
-            lhsView = lhsCast->view();
-          }
-          if (rhsView.type() != type_) {
-            rhsCast = cudf::cast(rhsView, type_, stream, mr);
-            rhsView = rhsCast->view();
-          }
-          return cudf::binary_operation(
-              lhsView, rhsView, op_, type_, stream, mr);
-        }
-        if (op_ == cudf::binary_operator::MUL) {
-          std::unique_ptr<cudf::column> lhsCast;
-          std::unique_ptr<cudf::column> rhsCast;
-          if (type_.id() == cudf::type_id::DECIMAL128) {
-            if (lhsView.type().id() == cudf::type_id::DECIMAL64) {
-              auto castType = cudf::data_type{
-                  cudf::type_id::DECIMAL128, lhsView.type().scale()};
-              lhsCast = cudf::cast(lhsView, castType, stream, mr);
-              lhsView = lhsCast->view();
-            }
-            if (rhsView.type().id() == cudf::type_id::DECIMAL64) {
-              auto castType = cudf::data_type{
-                  cudf::type_id::DECIMAL128, rhsView.type().scale()};
-              rhsCast = cudf::cast(rhsView, castType, stream, mr);
-              rhsView = rhsCast->view();
-            }
-          }
-          return cudf::binary_operation(
-              lhsView, rhsView, op_, type_, stream, mr);
-        }
-      }
       return cudf::binary_operation(
           asView(inputColumns[0]), *right_, op_, type_, stream, mr);
     }
-    if (op_ == cudf::binary_operator::DIV && cudf::is_fixed_point(type_)) {
-      auto rhsView = asView(inputColumns[0]);
-      if (hasDecimalZero(rhsView, stream, mr)) {
-        VELOX_USER_FAIL("Division by zero");
-      }
-      auto lhsScale = -left_->type().scale();
-      auto rhsScale = -rhsView.type().scale();
-      auto outScale = -type_.scale();
-      auto aRescale = outScale - lhsScale + rhsScale;
-      auto lhsCol =
-          cudf::make_column_from_scalar(*left_, rhsView.size(), stream, mr);
-      auto lhsView = lhsCol->view();
-      std::unique_ptr<cudf::column> lhsCast;
-      std::unique_ptr<cudf::column> rhsCast;
-      if (type_.id() == cudf::type_id::DECIMAL128) {
-        if (lhsView.type().id() == cudf::type_id::DECIMAL64) {
-          auto castType = cudf::data_type{
-              cudf::type_id::DECIMAL128, lhsView.type().scale()};
-          lhsCast = cudf::cast(lhsView, castType, stream, mr);
-          lhsView = lhsCast->view();
-        }
-        if (rhsView.type().id() == cudf::type_id::DECIMAL64) {
-          auto castType = cudf::data_type{
-              cudf::type_id::DECIMAL128, rhsView.type().scale()};
-          rhsCast = cudf::cast(rhsView, castType, stream, mr);
-          rhsView = rhsCast->view();
-        }
-      }
-      return decimalDivide(lhsView, rhsView, type_, aRescale, stream);
-    }
-    auto rhsView = asView(inputColumns[0]);
-    if (isComparisonOp(op_) && cudf::is_fixed_point(left_->type()) &&
-        cudf::is_fixed_point(rhsView.type())) {
-      auto lhsCol =
-          cudf::make_column_from_scalar(*left_, rhsView.size(), stream, mr);
-      auto lhsView = lhsCol->view();
-      auto lhsScale = -lhsView.type().scale();
-      auto rhsScale = -rhsView.type().scale();
-      auto targetScale = lhsScale > rhsScale ? lhsScale : rhsScale;
-      auto targetTypeId = (lhsView.type().id() == cudf::type_id::DECIMAL128 ||
-                           rhsView.type().id() == cudf::type_id::DECIMAL128)
-          ? cudf::type_id::DECIMAL128
-          : cudf::type_id::DECIMAL64;
-      auto targetType =
-          cudf::data_type{targetTypeId, numeric::scale_type{-targetScale}};
-      std::unique_ptr<cudf::column> lhsCast;
-      std::unique_ptr<cudf::column> rhsCast;
-      if (lhsView.type() != targetType) {
-        lhsCast = cudf::cast(lhsView, targetType, stream, mr);
-        lhsView = lhsCast->view();
-      }
-      if (rhsView.type() != targetType) {
-        rhsCast = cudf::cast(rhsView, targetType, stream, mr);
-        rhsView = rhsCast->view();
-      }
-      // @TODO Check for divide-by-zero as in the DECIMAL case above?
-      return cudf::binary_operation(lhsView, rhsView, op_, type_, stream, mr);
-    }
-    if (cudf::is_fixed_point(type_)) {
-      auto lhsCol =
-          cudf::make_column_from_scalar(*left_, rhsView.size(), stream, mr);
-      auto lhsView = lhsCol->view();
-      if (op_ == cudf::binary_operator::ADD ||
-          op_ == cudf::binary_operator::SUB ||
-          op_ == cudf::binary_operator::MOD) {
-        std::unique_ptr<cudf::column> lhsCast;
-        std::unique_ptr<cudf::column> rhsCast;
-        if (lhsView.type() != type_) {
-          lhsCast = cudf::cast(lhsView, type_, stream, mr);
-          lhsView = lhsCast->view();
-        }
-        if (rhsView.type() != type_) {
-          rhsCast = cudf::cast(rhsView, type_, stream, mr);
-          rhsView = rhsCast->view();
-        }
-        return cudf::binary_operation(lhsView, rhsView, op_, type_, stream, mr);
-      }
-      if (op_ == cudf::binary_operator::MUL) {
-        std::unique_ptr<cudf::column> lhsCast;
-        std::unique_ptr<cudf::column> rhsCast;
-        if (type_.id() == cudf::type_id::DECIMAL128) {
-          if (lhsView.type().id() == cudf::type_id::DECIMAL64) {
-            auto castType = cudf::data_type{
-                cudf::type_id::DECIMAL128, lhsView.type().scale()};
-            lhsCast = cudf::cast(lhsView, castType, stream, mr);
-            lhsView = lhsCast->view();
-          }
-          if (rhsView.type().id() == cudf::type_id::DECIMAL64) {
-            auto castType = cudf::data_type{
-                cudf::type_id::DECIMAL128, rhsView.type().scale()};
-            rhsCast = cudf::cast(rhsView, castType, stream, mr);
-            rhsView = rhsCast->view();
-          }
-        }
-        return cudf::binary_operation(lhsView, rhsView, op_, type_, stream, mr);
-      }
-    }
-    return cudf::binary_operation(*left_, rhsView, op_, type_, stream, mr);
+    return cudf::binary_operation(
+        *left_, asView(inputColumns[0]), op_, type_, stream, mr);
   }
 
  private:
@@ -711,33 +514,125 @@ class BinaryFunction : public CudfFunction {
   std::unique_ptr<cudf::scalar> right_;
 };
 
-class UnaryFunction : public CudfFunction {
+class LogicalFunction : public CudfFunction {
  public:
-  UnaryFunction(
+  LogicalFunction(
       const std::shared_ptr<velox::exec::Expr>& expr,
-      cudf::unary_operator op)
+      cudf::binary_operator op)
       : op_(op) {
-    VELOX_CHECK_EQ(
-        expr->inputs().size(), 1, "Unary function expects exactly 1 input");
-    auto constExpr =
-        std::dynamic_pointer_cast<velox::exec::ConstantExpr>(expr->inputs()[0]);
-    VELOX_CHECK_NULL(
-        constExpr, "Unary function on literal input is not supported");
-    // @TODO (seves 1/28/26)
-    // binary functions require at least ONE input to be non-literal
-    // do we need to support unary functions with ONLY a literal input?
-    // assuming not for now
+    VELOX_CHECK_GE(
+        expr->inputs().size(), 2, "Logical function expects at least 2 inputs");
+    literals_.reserve(expr->inputs().size());
+    for (const auto& input : expr->inputs()) {
+      auto constExpr =
+          std::dynamic_pointer_cast<velox::exec::ConstantExpr>(input);
+      if (constExpr) {
+        literals_.push_back(VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
+            createCudfScalar,
+            constExpr->value()->typeKind(),
+            constExpr->value()));
+      } else {
+        literals_.push_back(nullptr);
+      }
+    }
   }
 
   ColumnOrView eval(
       std::vector<ColumnOrView>& inputColumns,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
-    return cudf::unary_operation(asView(inputColumns[0]), op_, stream, mr);
+    size_t rowCount = 0;
+    if (!inputColumns.empty()) {
+      rowCount = asView(inputColumns[0]).size();
+    }
+    if (rowCount == 0 && inputColumns.empty()) {
+      rowCount = 1;
+    }
+
+    std::vector<std::unique_ptr<cudf::column>> literalColumns;
+    literalColumns.reserve(literals_.size());
+    std::vector<cudf::column_view> operands;
+    operands.reserve(literals_.size());
+
+    size_t columnIndex = 0;
+    for (const auto& literal : literals_) {
+      if (literal) {
+        auto column = cudf::make_column_from_scalar(*literal, rowCount, stream);
+        operands.push_back(column->view());
+        literalColumns.push_back(std::move(column));
+      } else {
+        VELOX_CHECK_LT(columnIndex, inputColumns.size());
+        operands.push_back(asView(inputColumns[columnIndex++]));
+      }
+    }
+
+    VELOX_CHECK(!operands.empty());
+    if (operands.size() == 1) {
+      if (!literalColumns.empty()) {
+        return std::move(literalColumns[0]);
+      }
+      return operands[0];
+    }
+
+    auto result = cudf::binary_operation(
+        operands[0], operands[1], op_, kBoolType, stream, mr);
+    for (size_t i = 2; i < operands.size(); ++i) {
+      result = cudf::binary_operation(
+          result->view(), operands[i], op_, kBoolType, stream, mr);
+    }
+    return result;
   }
 
  private:
-  const cudf::unary_operator op_;
+  static constexpr cudf::data_type kBoolType{cudf::type_id::BOOL8};
+  const cudf::binary_operator op_;
+  std::vector<std::unique_ptr<cudf::scalar>> literals_;
+};
+
+class NotFunction : public CudfFunction {
+ public:
+  explicit NotFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 1, "not expects 1 input");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK_EQ(inputColumns.size(), 1, "not expects 1 input");
+    return cudf::unary_operation(
+        asView(inputColumns[0]), cudf::unary_operator::NOT, stream, mr);
+  }
+};
+
+class IsNullFunction : public CudfFunction {
+ public:
+  explicit IsNullFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 1, "is_null expects 1 input");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK_EQ(inputColumns.size(), 1, "is_null expects 1 input");
+    return cudf::is_null(asView(inputColumns[0]), stream, mr);
+  }
+};
+
+class IsNotNullFunction : public CudfFunction {
+ public:
+  explicit IsNotNullFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 1, "isnotnull expects 1 input");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK_EQ(inputColumns.size(), 1, "isnotnull expects 1 input");
+    return cudf::is_valid(asView(inputColumns[0]), stream, mr);
+  }
 };
 
 class BetweenFunction : public CudfFunction {
@@ -822,80 +717,6 @@ class BetweenFunction : public CudfFunction {
   std::unique_ptr<cudf::scalar> maxLiteral_;
 };
 
-class GreatestLeastFunction : public CudfFunction {
- public:
-  GreatestLeastFunction(
-      const std::shared_ptr<velox::exec::Expr>& expr,
-      cudf::binary_operator op)
-      : op_(op), type_(cudf_velox::veloxToCudfDataType(expr->type())) {
-    // must have at least three inputs
-    VELOX_CHECK_GE(
-        expr->inputs().size(),
-        3,
-        "Greatest/Least function expects at least 3 inputs");
-    // scan inputs for literals
-    for (size_t i = 0; i < expr->inputs().size(); ++i) {
-      auto constExpr = std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
-          expr->inputs()[i]);
-      if (constExpr) {
-        literals_.push_back(VELOX_DYNAMIC_SCALAR_TYPE_DISPATCH(
-            createCudfScalar,
-            constExpr->value()->typeKind(),
-            constExpr->value()));
-      } else {
-        literals_.push_back(nullptr);
-      }
-    }
-  }
-
-  ColumnOrView eval(
-      std::vector<ColumnOrView>& inputColumns,
-      rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr) const override {
-    // construct a chain of NULL_MIN or NULL_MAX operations
-    std::unique_ptr<cudf::column> result;
-    // the first pair of values
-    if (literals_[0] && literals_[1]) {
-      // no variant of cudf::binary_operation that takes two scalars so we must
-      // create columns
-      auto col0 = cudf::make_column_from_scalar(*literals_[0], 1, stream);
-      auto col1 = cudf::make_column_from_scalar(*literals_[1], 1, stream);
-      result = cudf::binary_operation(
-          col0->view(), col1->view(), op_, type_, stream, mr);
-    } else if (literals_[0]) {
-      result = cudf::binary_operation(
-          *literals_[0], asView(inputColumns[1]), op_, type_, stream, mr);
-    } else if (literals_[1]) {
-      result = cudf::binary_operation(
-          asView(inputColumns[0]), *literals_[1], op_, type_, stream, mr);
-    } else {
-      result = cudf::binary_operation(
-          asView(inputColumns[0]),
-          asView(inputColumns[1]),
-          op_,
-          type_,
-          stream,
-          mr);
-    }
-    // remaining values
-    for (size_t i = 2; i < inputColumns.size(); ++i) {
-      if (literals_[i]) {
-        result = cudf::binary_operation(
-            result->view(), *literals_[i], op_, type_, stream, mr);
-      } else {
-        result = cudf::binary_operation(
-            result->view(), asView(inputColumns[i]), op_, type_, stream, mr);
-      }
-    }
-    return result;
-  }
-
- private:
-  const cudf::binary_operator op_;
-  const cudf::data_type type_;
-  std::vector<std::unique_ptr<cudf::scalar>> literals_;
-};
-
 class SwitchFunction : public CudfFunction {
  public:
   SwitchFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
@@ -927,24 +748,39 @@ class SwitchFunction : public CudfFunction {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     if (left_ == nullptr && right_ == nullptr) {
+      auto lhsView = asView(inputColumns[1]);
+      auto rhsView = asView(inputColumns[2]);
+      if (lhsView.type() != rhsView.type()) {
+        auto targetType = lhsView.type();
+        auto casted = cudf::cast(rhsView, targetType, stream, mr);
+        return cudf::copy_if_else(
+            lhsView, casted->view(), asView(inputColumns[0]), stream, mr);
+      }
       return cudf::copy_if_else(
-          asView(inputColumns[1]),
-          asView(inputColumns[2]),
-          asView(inputColumns[0]),
-          stream,
-          mr);
+          lhsView, rhsView, asView(inputColumns[0]), stream, mr);
     } else if (left_ == nullptr) {
+      auto lhsView = asView(inputColumns[1]);
+      if (!right_->is_valid() && right_->type() != lhsView.type()) {
+        auto nullScalar = cudf::make_default_constructed_scalar(
+            lhsView.type(), stream, mr);
+        nullScalar->set_valid_async(false, stream);
+        return cudf::copy_if_else(
+            lhsView, *nullScalar, asView(inputColumns[0]), stream, mr);
+      }
       return cudf::copy_if_else(
-          asView(inputColumns[1]),
-          *right_,
-          asView(inputColumns[0]),
-          stream,
-          mr);
+          lhsView, *right_, asView(inputColumns[0]), stream, mr);
     } else if (right_ == nullptr) {
+      auto rhsView = asView(inputColumns[1]);
+      if (!left_->is_valid() && left_->type() != rhsView.type()) {
+        auto nullScalar = cudf::make_default_constructed_scalar(
+            rhsView.type(), stream, mr);
+        nullScalar->set_valid_async(false, stream);
+        return cudf::copy_if_else(
+            *nullScalar, rhsView, asView(inputColumns[0]), stream, mr);
+      }
       return cudf::copy_if_else(
-          *left_, asView(inputColumns[1]), asView(inputColumns[0]), stream, mr);
+          *left_, rhsView, asView(inputColumns[0]), stream, mr);
     }
-    // right != null and left != null
     return cudf::copy_if_else(
         *left_, *right_, asView(inputColumns[0]), stream, mr);
   }
@@ -966,28 +802,30 @@ class SubstrFunction : public CudfFunction {
     auto startExpr = std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
     VELOX_CHECK_NOT_NULL(startExpr, "substr start must be a constant");
 
-    auto startValue =
-        startExpr->value()->as<SimpleVector<int64_t>>()->valueAt(0);
-    start_ = static_cast<cudf::size_type>(startValue);
+    auto getIntValue = [](const VectorPtr& vec) -> int64_t {
+      VELOX_CHECK_NOT_NULL(vec, "substr constant value is null");
+      if (auto v64 = vec->as<SimpleVector<int64_t>>()) {
+        return v64->valueAt(0);
+      }
+      if (auto v32 = vec->as<SimpleVector<int32_t>>()) {
+        return static_cast<int64_t>(v32->valueAt(0));
+      }
+      VELOX_FAIL("substr constant must be integer type, got: {}", vec->type()->toString());
+    };
+
+    auto startValue = getIntValue(startExpr->value());
+    adjustedStart_ = static_cast<cudf::size_type>(startValue);
     if (startValue >= 1) {
-      // cuDF indexing starts at 0.
-      // Presto indexing starts at 1.
-      // Positive indices need to substract 1.
-      start_ = static_cast<cudf::size_type>(startValue - 1);
+      adjustedStart_ = static_cast<cudf::size_type>(startValue - 1);
     }
 
-    if (expr->inputs().size() > 2) {
+    hasLength_ = expr->inputs().size() > 2;
+    if (hasLength_) {
       auto lengthExpr =
           std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[2]);
       VELOX_CHECK_NOT_NULL(lengthExpr, "substr length must be a constant");
-
-      auto lengthValue =
-          lengthExpr->value()->as<SimpleVector<int64_t>>()->valueAt(0);
-      // cuDF uses indices [begin, end).
-      // Presto uses length as the length of the substring.
-      // We compute the end as start + length.
-      end_ = start_ + static_cast<cudf::size_type>(lengthValue);
-      hasEnd_ = true;
+      auto lengthValue = getIntValue(lengthExpr->value());
+      endPosition_ = adjustedStart_ + static_cast<cudf::size_type>(lengthValue);
     }
   }
 
@@ -995,19 +833,39 @@ class SubstrFunction : public CudfFunction {
       std::vector<ColumnOrView>& inputColumns,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
+    ensureScalars(stream, mr);
     auto inputCol = asView(inputColumns[0]);
-    cudf::numeric_scalar<cudf::size_type> startScalar(start_, true, stream, mr);
-    cudf::numeric_scalar<cudf::size_type> endScalar(
-        hasEnd_ ? end_ : 0, hasEnd_, stream, mr);
-    cudf::numeric_scalar<cudf::size_type> stepScalar(1, true, stream, mr);
     return cudf::strings::slice_strings(
-        inputCol, startScalar, endScalar, stepScalar, stream, mr);
+        inputCol, *startScalar_, *endScalar_, *stepScalar_, stream, mr);
   }
 
  private:
-  cudf::size_type start_{0};
-  cudf::size_type end_{0};
-  bool hasEnd_{false};
+  cudf::size_type adjustedStart_{0};
+  cudf::size_type endPosition_{0};
+  bool hasLength_{false};
+
+  mutable std::unique_ptr<cudf::numeric_scalar<cudf::size_type>> startScalar_;
+  mutable std::unique_ptr<cudf::numeric_scalar<cudf::size_type>> endScalar_;
+  mutable std::unique_ptr<cudf::numeric_scalar<cudf::size_type>> stepScalar_;
+
+  void ensureScalars(
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const {
+    if (startScalar_) {
+      return;
+    }
+    startScalar_ = std::make_unique<cudf::numeric_scalar<cudf::size_type>>(
+        adjustedStart_, true, stream, mr);
+    if (hasLength_) {
+      endScalar_ = std::make_unique<cudf::numeric_scalar<cudf::size_type>>(
+          endPosition_, true, stream, mr);
+    } else {
+      endScalar_ = std::make_unique<cudf::numeric_scalar<cudf::size_type>>(
+          0, false, stream, mr);
+    }
+    stepScalar_ = std::make_unique<cudf::numeric_scalar<cudf::size_type>>(
+        1, true, stream, mr);
+  }
 };
 
 class CoalesceFunction : public CudfFunction {
@@ -1026,18 +884,6 @@ class CoalesceFunction : public CudfFunction {
           literalScalar_ = makeScalarFromConstantExpr(c);
           numColumnsBeforeLiteral_ = i;
           break;
-        }
-      } else if (input->distinctFields().empty() && !input->inputs().empty()) {
-        // Handle constant expressions that weren't folded (e.g., cast of
-        // literal).
-        if (auto innerConst =
-                std::dynamic_pointer_cast<velox::exec::ConstantExpr>(
-                    input->inputs()[0])) {
-          if (!innerConst->value()->isNullAt(0)) {
-            literalScalar_ = makeScalarFromConstantExpr(innerConst);
-            numColumnsBeforeLiteral_ = i;
-            break;
-          }
         }
       }
     }
@@ -1122,11 +968,14 @@ class HashFunction : public CudfFunction {
   uint32_t seedValue_;
 };
 
-class YearFunction : public CudfFunction {
+class ExtractComponentFunction : public CudfFunction {
  public:
-  explicit YearFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+  ExtractComponentFunction(
+      const std::shared_ptr<velox::exec::Expr>& expr,
+      cudf::datetime::datetime_component component)
+      : component_(component) {
     VELOX_CHECK_EQ(
-        expr->inputs().size(), 1, "year expects exactly 1 input column");
+        expr->inputs().size(), 1, "extract expects exactly 1 input column");
   }
 
   ColumnOrView eval(
@@ -1135,8 +984,275 @@ class YearFunction : public CudfFunction {
       rmm::device_async_resource_ref mr) const override {
     auto inputCol = asView(inputColumns[0]);
     return cudf::datetime::extract_datetime_component(
-        inputCol, cudf::datetime::datetime_component::YEAR, stream, mr);
+        inputCol, component_, stream, mr);
   }
+
+ private:
+  cudf::datetime::datetime_component component_;
+};
+
+class QuarterFunction : public CudfFunction {
+ public:
+  explicit QuarterFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(), 1, "quarter expects exactly 1 input column");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    auto inputCol = asView(inputColumns[0]);
+    return cudf::datetime::extract_quarter(inputCol, stream, mr);
+  }
+};
+
+class DayOfYearFunction : public CudfFunction {
+ public:
+  explicit DayOfYearFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(), 1, "day_of_year expects exactly 1 input column");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    auto inputCol = asView(inputColumns[0]);
+    return cudf::datetime::day_of_year(inputCol, stream, mr);
+  }
+};
+
+class WeekFunction : public CudfFunction {
+ public:
+  explicit WeekFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(), 1, "week expects exactly 1 input column");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    auto inputCol = asView(inputColumns[0]);
+    auto weekStrings = cudf::strings::from_timestamps(
+        inputCol, "%V", cudf::strings_column_view{}, stream, mr);
+    return cudf::strings::to_integers(
+        cudf::strings_column_view(weekStrings->view()),
+        cudf::data_type(cudf::type_id::INT32),
+        stream,
+        mr);
+  }
+};
+
+class YearOfWeekFunction : public CudfFunction {
+ public:
+  explicit YearOfWeekFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(
+        expr->inputs().size(),
+        1,
+        "year_of_week expects exactly 1 input column");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    auto inputCol = asView(inputColumns[0]);
+    auto yearStrings = cudf::strings::from_timestamps(
+        inputCol, "%G", cudf::strings_column_view{}, stream, mr);
+    return cudf::strings::to_integers(
+        cudf::strings_column_view(yearStrings->view()),
+        cudf::data_type(cudf::type_id::INT32),
+        stream,
+        mr);
+  }
+};
+
+class DateTruncFunction : public CudfFunction {
+ public:
+  explicit DateTruncFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    using velox::exec::ConstantExpr;
+    VELOX_CHECK_EQ(
+        expr->inputs().size(), 2, "date_trunc expects exactly 2 inputs");
+    auto unitExpr = std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[0]);
+    VELOX_CHECK_NOT_NULL(unitExpr, "date_trunc unit must be a constant");
+    auto inputType = expr->inputs()[1]->type();
+    isTimestamp_ = inputType->isTimestamp();
+    isDate_ = inputType->isDate();
+    VELOX_CHECK(
+        isTimestamp_ || isDate_,
+        "date_trunc only supports date or timestamp inputs");
+    unit_ = parseDateTruncUnit(
+        normalizeDateTruncUnit(unitExpr->value()->toString(0)),
+        isTimestamp_,
+        isDate_);
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    auto inputCol = asView(inputColumns[0]);
+    auto outputType = inputCol.type();
+    auto dayType = cudf::data_type(cudf::type_id::TIMESTAMP_DAYS);
+    auto intType = cudf::data_type(cudf::type_id::INT32);
+    auto durationDayType = cudf::data_type(cudf::type_id::DURATION_DAYS);
+
+    auto castToDay = [&](cudf::column_view col) {
+      return cudf::cast(col, dayType, stream, mr);
+    };
+    auto castToInt32 = [&](cudf::column_view col) {
+      return cudf::cast(col, intType, stream, mr);
+    };
+    auto castToDurationDays = [&](cudf::column_view col) {
+      return cudf::cast(col, durationDayType, stream, mr);
+    };
+    auto castDaysToOutput =
+        [&](std::unique_ptr<cudf::column> daysCol) -> ColumnOrView {
+      if (daysCol->type() == outputType) {
+        return daysCol;
+      }
+      return cudf::cast(daysCol->view(), outputType, stream, mr);
+    };
+
+    auto makeScalar = [&](int32_t value) {
+      return cudf::numeric_scalar<int32_t>(value, true, stream, mr);
+    };
+
+    switch (unit_) {
+      case DateTruncUnit::kSecond:
+        return cudf::datetime::floor_datetimes(
+            inputCol, cudf::datetime::rounding_frequency::SECOND, stream, mr);
+      case DateTruncUnit::kMinute:
+        return cudf::datetime::floor_datetimes(
+            inputCol, cudf::datetime::rounding_frequency::MINUTE, stream, mr);
+      case DateTruncUnit::kHour:
+        return cudf::datetime::floor_datetimes(
+            inputCol, cudf::datetime::rounding_frequency::HOUR, stream, mr);
+      case DateTruncUnit::kDay: {
+        auto dayCol = castToDay(inputCol);
+        return castDaysToOutput(std::move(dayCol));
+      }
+      case DateTruncUnit::kWeek: {
+        auto dayCol = castToDay(inputCol);
+        auto dowCol = cudf::datetime::extract_datetime_component(
+            dayCol->view(),
+            cudf::datetime::datetime_component::WEEKDAY,
+            stream,
+            mr);
+        auto dowInt = castToInt32(dowCol->view());
+        auto oneScalar = makeScalar(1);
+        auto offset = cudf::binary_operation(
+            dowInt->view(),
+            oneScalar,
+            cudf::binary_operator::SUB,
+            intType,
+            stream,
+            mr);
+        auto offsetDur = castToDurationDays(offset->view());
+        auto weekStartDay = cudf::binary_operation(
+            dayCol->view(),
+            offsetDur->view(),
+            cudf::binary_operator::SUB,
+            dayType,
+            stream,
+            mr);
+        return castDaysToOutput(std::move(weekStartDay));
+      }
+      case DateTruncUnit::kMonth:
+      case DateTruncUnit::kQuarter:
+      case DateTruncUnit::kYear: {
+        auto dayCol = castToDay(inputCol);
+        auto dayOfMonth = cudf::datetime::extract_datetime_component(
+            dayCol->view(),
+            cudf::datetime::datetime_component::DAY,
+            stream,
+            mr);
+        auto dayOfMonthInt = castToInt32(dayOfMonth->view());
+        auto oneScalar = makeScalar(1);
+        auto dayOffset = cudf::binary_operation(
+            dayOfMonthInt->view(),
+            oneScalar,
+            cudf::binary_operator::SUB,
+            intType,
+            stream,
+            mr);
+        auto dayOffsetDur = castToDurationDays(dayOffset->view());
+        auto monthStartDay = cudf::binary_operation(
+            dayCol->view(),
+            dayOffsetDur->view(),
+            cudf::binary_operator::SUB,
+            dayType,
+            stream,
+            mr);
+
+        if (unit_ == DateTruncUnit::kMonth) {
+          return castDaysToOutput(std::move(monthStartDay));
+        }
+
+        auto monthCol = cudf::datetime::extract_datetime_component(
+            dayCol->view(),
+            cudf::datetime::datetime_component::MONTH,
+            stream,
+            mr);
+        auto monthInt = castToInt32(monthCol->view());
+        auto monthIndex = cudf::binary_operation(
+            monthInt->view(),
+            oneScalar,
+            cudf::binary_operator::SUB,
+            intType,
+            stream,
+            mr);
+
+        std::unique_ptr<cudf::column> monthsToSubtract;
+        if (unit_ == DateTruncUnit::kYear) {
+          monthsToSubtract = std::move(monthIndex);
+        } else {
+          auto threeScalar = makeScalar(3);
+          auto quarterIndex = cudf::binary_operation(
+              monthIndex->view(),
+              threeScalar,
+              cudf::binary_operator::FLOOR_DIV,
+              intType,
+              stream,
+              mr);
+          auto quarterStart = cudf::binary_operation(
+              quarterIndex->view(),
+              threeScalar,
+              cudf::binary_operator::MUL,
+              intType,
+              stream,
+              mr);
+          monthsToSubtract = cudf::binary_operation(
+              monthIndex->view(),
+              quarterStart->view(),
+              cudf::binary_operator::SUB,
+              intType,
+              stream,
+              mr);
+        }
+
+        auto negOneScalar = makeScalar(-1);
+        auto negMonths = cudf::binary_operation(
+            monthsToSubtract->view(),
+            negOneScalar,
+            cudf::binary_operator::MUL,
+            intType,
+            stream,
+            mr);
+        auto truncated = cudf::datetime::add_calendrical_months(
+            monthStartDay->view(), negMonths->view(), stream, mr);
+        return castDaysToOutput(std::move(truncated));
+      }
+    }
+    VELOX_UNREACHABLE();
+  }
+
+ private:
+  DateTruncUnit unit_;
+  bool isTimestamp_{false};
+  bool isDate_{false};
 };
 
 class LengthFunction : public CudfFunction {
@@ -1218,10 +1334,14 @@ class StartswithFunction : public CudfFunction {
     using velox::exec::ConstantExpr;
     VELOX_CHECK_EQ(expr->inputs().size(), 2, "startswith expects 2 inputs");
 
+    auto stream = cudf::get_default_stream();
+    auto mr = cudf::get_current_device_resource_ref();
+
     auto patternExpr =
         std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
     VELOX_CHECK_NOT_NULL(patternExpr, "startswith pattern must be a constant");
-    pattern_ = patternExpr->value()->toString(0);
+    pattern_ = std::make_unique<cudf::string_scalar>(
+        patternExpr->value()->toString(0), true, stream, mr);
   }
 
   ColumnOrView eval(
@@ -1229,12 +1349,11 @@ class StartswithFunction : public CudfFunction {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     auto inputCol = asView(inputColumns[0]);
-    cudf::string_scalar patternScalar(pattern_, true, stream, mr);
-    return cudf::strings::starts_with(inputCol, patternScalar, stream, mr);
+    return cudf::strings::starts_with(inputCol, *pattern_, stream, mr);
   }
 
  private:
-  std::string pattern_;
+  std::unique_ptr<cudf::string_scalar> pattern_;
 };
 
 class EndswithFunction : public CudfFunction {
@@ -1243,10 +1362,14 @@ class EndswithFunction : public CudfFunction {
     using velox::exec::ConstantExpr;
     VELOX_CHECK_EQ(expr->inputs().size(), 2, "endswith expects 2 inputs");
 
+    auto stream = cudf::get_default_stream();
+    auto mr = cudf::get_current_device_resource_ref();
+
     auto patternExpr =
         std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
     VELOX_CHECK_NOT_NULL(patternExpr, "endswith pattern must be a constant");
-    pattern_ = patternExpr->value()->toString(0);
+    pattern_ = std::make_unique<cudf::string_scalar>(
+        patternExpr->value()->toString(0), true, stream, mr);
   }
 
   ColumnOrView eval(
@@ -1254,12 +1377,11 @@ class EndswithFunction : public CudfFunction {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     auto inputCol = asView(inputColumns[0]);
-    cudf::string_scalar patternScalar(pattern_, true, stream, mr);
-    return cudf::strings::ends_with(inputCol, patternScalar, stream, mr);
+    return cudf::strings::ends_with(inputCol, *pattern_, stream, mr);
   }
 
  private:
-  std::string pattern_;
+  std::unique_ptr<cudf::string_scalar> pattern_;
 };
 
 class ContainsFunction : public CudfFunction {
@@ -1268,10 +1390,14 @@ class ContainsFunction : public CudfFunction {
     using velox::exec::ConstantExpr;
     VELOX_CHECK_EQ(expr->inputs().size(), 2, "contains expects 2 inputs");
 
+    auto stream = cudf::get_default_stream();
+    auto mr = cudf::get_current_device_resource_ref();
+
     auto patternExpr =
         std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1]);
     VELOX_CHECK_NOT_NULL(patternExpr, "contains pattern must be a constant");
-    pattern_ = patternExpr->value()->toString(0);
+    pattern_ = std::make_unique<cudf::string_scalar>(
+        patternExpr->value()->toString(0), true, stream, mr);
   }
 
   ColumnOrView eval(
@@ -1279,84 +1405,11 @@ class ContainsFunction : public CudfFunction {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     auto inputCol = asView(inputColumns[0]);
-    cudf::string_scalar patternScalar(pattern_, true, stream, mr);
-    return cudf::strings::contains(inputCol, patternScalar, stream, mr);
+    return cudf::strings::contains(inputCol, *pattern_, stream, mr);
   }
 
  private:
-  std::string pattern_;
-};
-
-class ConcatFunction : public CudfFunction {
- public:
-  explicit ConcatFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
-    using velox::exec::ConstantExpr;
-    numInputs_ = expr->inputs().size();
-    VELOX_CHECK_GE(numInputs_, 2, "concat expects at least 2 inputs");
-
-    // Scan inputs for literals and store strings in map by input index.
-    for (size_t i = 0; i < numInputs_; ++i) {
-      if (auto constant =
-              std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[i])) {
-        inputIndexToLiteral_[i] = constant->value()->toString(0);
-      }
-    }
-  }
-
-  ColumnOrView eval(
-      std::vector<ColumnOrView>& inputColumns,
-      rmm::cuda_stream_view stream,
-      rmm::device_async_resource_ref mr) const override {
-    // Validate sizes.
-    VELOX_CHECK_EQ(
-        inputColumns.size() + inputIndexToLiteral_.size(),
-        numInputs_,
-        "Unexpected number of input columns");
-
-    // If there is at least one input column, fetch its size as the output size.
-    // If there are no input columns, this means that all the inputs are
-    // literals, and the output size will be 1.
-    const size_t outputSize =
-        inputColumns.empty() ? 1u : asView(inputColumns[0]).size();
-
-    // Iterate the inputs, building a vector of column views, either a literal
-    // from the map, or the next input column. We also keep a vector of the
-    // columns created for literals, so that they persist while their views
-    // are used in the concatenation.
-    std::vector<cudf::column_view> columnViews;
-    std::vector<std::unique_ptr<cudf::column>> literalColumns;
-    size_t nextInputColumnIndex = 0u;
-    for (size_t i = 0; i < numInputs_; ++i) {
-      auto it = inputIndexToLiteral_.find(i);
-      if (it == inputIndexToLiteral_.end()) {
-        // No literal for this input. Use the next input column.
-        auto& column = inputColumns[nextInputColumnIndex++];
-        columnViews.push_back(asView(column));
-      } else {
-        // Create a column of the literal repeated for the entire output size.
-        auto const& literal = it->second;
-        cudf::string_scalar scalar(literal, true, stream, mr);
-        auto col =
-            cudf::make_column_from_scalar(scalar, outputSize, stream, mr);
-        columnViews.push_back(col->view());
-        literalColumns.emplace_back(std::move(col));
-      }
-    }
-
-    // Concatenate the columns, nulls as empty strings, no separators.
-    cudf::string_scalar emptyString("", true, stream, mr);
-    return cudf::strings::concatenate(
-        cudf::table_view(columnViews),
-        emptyString,
-        emptyString,
-        cudf::strings::separator_on_nulls::YES,
-        stream,
-        mr);
-  }
-
- private:
-  std::map<int, std::string> inputIndexToLiteral_;
-  size_t numInputs_{0};
+  std::unique_ptr<cudf::string_scalar> pattern_;
 };
 
 bool registerCudfFunction(
@@ -1393,44 +1446,6 @@ std::shared_ptr<CudfFunction> createCudfFunction(
   return nullptr;
 }
 
-void registerSparkFunctions(const std::string& prefix) {
-  using exec::FunctionSignatureBuilder;
-
-  registerCudfFunction(
-      prefix + "hash_with_seed",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
-        return std::make_shared<HashFunction>(expr);
-      },
-      {FunctionSignatureBuilder()
-           .returnType("bigint")
-           .constantArgumentType("integer")
-           .argumentType("any")
-           .build()});
-
-  registerCudfFunction(
-      prefix + "date_add",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
-        return std::make_shared<DateAddFunction>(expr);
-      },
-      {FunctionSignatureBuilder()
-           .returnType("date")
-           .argumentType("date")
-           .constantArgumentType("tinyint")
-           .build(),
-       FunctionSignatureBuilder()
-           .returnType("date")
-           .argumentType("date")
-           .constantArgumentType("smallint")
-           .build(),
-       FunctionSignatureBuilder()
-           .returnType("date")
-           .argumentType("date")
-           .constantArgumentType("integer")
-           .build()});
-}
-
-void registerPrestoFunctions(const std::string& prefix) {}
-
 bool registerBuiltinFunctions(const std::string& prefix) {
   using exec::FunctionSignatureBuilder;
 
@@ -1465,6 +1480,18 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .argumentType("array(any)")
            .build()});
 
+  registerCudfFunction(
+      prefix + "subscript",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<SubscriptFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .typeVariable("T")
+           .returnType("T")
+           .argumentType("array(T)")
+           .argumentType("bigint")
+           .build()});
+
   registerCudfFunctions(
       {prefix + "substr", prefix + "substring"},
       [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
@@ -1495,24 +1522,122 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .variableArity("T")
            .build()});
 
+
+  registerCudfFunction(
+      "and",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<LogicalFunction>(
+            expr, cudf::binary_operator::LOGICAL_AND);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("boolean")
+           .argumentType("boolean")
+           .argumentType("boolean")
+           .build()});
+
+
+  registerCudfFunction(
+      "or",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<LogicalFunction>(
+            expr, cudf::binary_operator::LOGICAL_OR);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("boolean")
+           .argumentType("boolean")
+           .argumentType("boolean")
+           .build()});
+
+
+  registerCudfFunction(
+      "not",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<NotFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("boolean")
+           .argumentType("boolean")
+           .build()});
+
+
+  registerCudfFunction(
+      "is_null",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<IsNullFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .typeVariable("T")
+           .returnType("boolean")
+           .argumentType("T")
+           .build()});
+
+
+  registerCudfFunction(
+      "isnotnull",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<IsNotNullFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .typeVariable("T")
+           .returnType("boolean")
+           .argumentType("T")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "hash_with_seed",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<HashFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("bigint")
+           .constantArgumentType("integer")
+           .argumentType("any")
+           .variableArity()
+           .build()});
+
+  registerCudfFunction(
+      "and",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<LogicalFunction>(
+            expr, cudf::binary_operator::LOGICAL_AND);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("boolean")
+           .argumentType("boolean")
+           .variableArity("boolean")
+           .build()});
+
+  registerCudfFunction(
+      "or",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<LogicalFunction>(
+            expr, cudf::binary_operator::LOGICAL_OR);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("boolean")
+           .argumentType("boolean")
+           .variableArity("boolean")
+           .build()});
+
   registerCudfFunction(
       prefix + "round",
       [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
         return std::make_shared<RoundFunction>(expr);
       },
-      {FunctionSignatureBuilder()
-           .integerVariable("p")
-           .integerVariable("s")
-           .returnType("decimal(p,s)")
-           .argumentType("decimal(p,s)")
-           .build(),
-       FunctionSignatureBuilder()
-           .integerVariable("p")
-           .integerVariable("s")
-           .returnType("decimal(p,s)")
-           .argumentType("decimal(p,s)")
-           .constantArgumentType("integer")
-           .build(),
+      {// TODO(dm): Enable after adding decimal support to velox-cudf
+       //   FunctionSignatureBuilder()
+       //      .integerVariable("p")
+       //      .integerVariable("s")
+       //      .returnType("decimal(p,s)")
+       //      .argumentType("decimal(p,s)")
+       //      .build(),
+       //  FunctionSignatureBuilder()
+       //      .integerVariable("p")
+       //      .integerVariable("s")
+       //      .returnType("decimal(p,s)")
+       //      .argumentType("decimal(p,s)")
+       //      .constantArgumentType("integer")
+       //      .build(),
        FunctionSignatureBuilder()
            .returnType("tinyint")
            .argumentType("tinyint")
@@ -1547,22 +1672,128 @@ bool registerBuiltinFunctions(const std::string& prefix) {
        FunctionSignatureBuilder()
            .returnType("bigint")
            .argumentType("bigint")
+           .constantArgumentType("integer")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("double")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("double")
+           .constantArgumentType("integer")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("real")
+           .argumentType("real")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("real")
+           .argumentType("real")
            .constantArgumentType("integer")
            .build()});
+
+  const std::vector<exec::FunctionSignaturePtr> timestampDateIntegerSignatures{
+      FunctionSignatureBuilder()
+          .returnType("integer")
+          .argumentType("timestamp")
+          .build(),
+      FunctionSignatureBuilder()
+          .returnType("integer")
+          .argumentType("date")
+          .build()};
 
   registerCudfFunction(
       prefix + "year",
       [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
-        return std::make_shared<YearFunction>(expr);
+        return std::make_shared<ExtractComponentFunction>(
+            expr, cudf::datetime::datetime_component::YEAR);
       },
-      {FunctionSignatureBuilder()
-           .returnType("integer")
-           .argumentType("timestamp")
-           .build(),
-       FunctionSignatureBuilder()
-           .returnType("integer")
-           .argumentType("date")
-           .build()});
+      timestampDateIntegerSignatures);
+
+  registerCudfFunction(
+      prefix + "month",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<ExtractComponentFunction>(
+            expr, cudf::datetime::datetime_component::MONTH);
+      },
+      timestampDateIntegerSignatures);
+
+  registerCudfFunction(
+      prefix + "day",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<ExtractComponentFunction>(
+            expr, cudf::datetime::datetime_component::DAY);
+      },
+      timestampDateIntegerSignatures);
+
+  registerCudfFunctions(
+      {prefix + "dow", prefix + "day_of_week"},
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<ExtractComponentFunction>(
+            expr, cudf::datetime::datetime_component::WEEKDAY);
+      },
+      timestampDateIntegerSignatures);
+
+  registerCudfFunctions(
+      {prefix + "doy", prefix + "day_of_year"},
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<DayOfYearFunction>(expr);
+      },
+      timestampDateIntegerSignatures);
+
+  registerCudfFunctions(
+      {prefix + "week", prefix + "week_of_year"},
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<WeekFunction>(expr);
+      },
+      timestampDateIntegerSignatures);
+
+  registerCudfFunction(
+      prefix + "quarter",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<QuarterFunction>(expr);
+      },
+      timestampDateIntegerSignatures);
+
+  registerCudfFunctions(
+      {prefix + "yow", prefix + "year_of_week"},
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<YearOfWeekFunction>(expr);
+      },
+      timestampDateIntegerSignatures);
+
+  registerCudfFunction(
+      prefix + "hour",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<ExtractComponentFunction>(
+            expr, cudf::datetime::datetime_component::HOUR);
+      },
+      timestampDateIntegerSignatures);
+
+  registerCudfFunction(
+      prefix + "minute",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<ExtractComponentFunction>(
+            expr, cudf::datetime::datetime_component::MINUTE);
+      },
+      timestampDateIntegerSignatures);
+
+  registerCudfFunction(
+      prefix + "second",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<ExtractComponentFunction>(
+            expr, cudf::datetime::datetime_component::SECOND);
+      },
+      timestampDateIntegerSignatures);
+
+  registerCudfFunction(
+      prefix + "millisecond",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<ExtractComponentFunction>(
+            expr, cudf::datetime::datetime_component::MILLISECOND);
+      },
+      timestampDateIntegerSignatures);
 
   registerCudfFunction(
       prefix + "length",
@@ -1605,17 +1836,6 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .constantArgumentType("varchar")
            .build()});
 
-  registerCudfFunction(
-      prefix + "concat",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
-        return std::make_shared<ConcatFunction>(expr);
-      },
-      {FunctionSignatureBuilder()
-           .returnType("varchar")
-           .argumentType("varchar")
-           .variableArity("varchar")
-           .build()});
-
   // No prefix because switch and if are special form
   registerCudfFunctions(
       {"switch", "if"},
@@ -1640,87 +1860,72 @@ bool registerBuiltinFunctions(const std::string& prefix) {
           // Cast needs special handling dynamically using cudf.
       });
 
-  if (CudfConfig::getInstance().functionEngine == "spark") {
-    registerSparkFunctions(prefix);
-  } else {
-    registerPrestoFunctions(prefix);
-  }
+  registerCudfFunction(
+      prefix + "date_add",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<DateAddFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("date")
+           .argumentType("date")
+           .constantArgumentType("tinyint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("date")
+           .argumentType("date")
+           .constantArgumentType("smallint")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("date")
+           .argumentType("date")
+           .constantArgumentType("integer")
+           .build()});
 
-  //
-  // regular binary operators
-  //
 
-  auto registerBinaryOp = [&](const std::vector<std::string>& aliases,
-                              cudf::binary_operator op) {
-    auto decimalBinarySignature = [&](cudf::binary_operator decimalOp) {
-      std::string rPrecisionConstraint;
-      std::string rScaleConstraint;
-      switch (decimalOp) {
-        case cudf::binary_operator::ADD:
-        case cudf::binary_operator::SUB:
-          rPrecisionConstraint =
-              "min(38, max(a_precision - a_scale, b_precision - b_scale) + "
-              "max(a_scale, b_scale) + 1)";
-          rScaleConstraint = "max(a_scale, b_scale)";
-          break;
-        case cudf::binary_operator::MUL:
-          rPrecisionConstraint = "min(38, a_precision + b_precision)";
-          rScaleConstraint = "a_scale + b_scale";
-          break;
-        case cudf::binary_operator::DIV:
-          rPrecisionConstraint =
-              "min(38, a_precision + b_scale + max(0, b_scale - a_scale))";
-          rScaleConstraint = "max(a_scale, b_scale)";
-          break;
-        case cudf::binary_operator::MOD:
-          rPrecisionConstraint =
-              "min(b_precision - b_scale, a_precision - a_scale) + "
-              "max(a_scale, b_scale)";
-          rScaleConstraint = "max(a_scale, b_scale)";
-          break;
-        default:
-          VELOX_FAIL("Unsupported decimal binary operator");
-      }
+  registerCudfFunction(
+      prefix + "date_trunc",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<DateTruncFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("timestamp")
+           .constantArgumentType("varchar")
+           .argumentType("timestamp")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("date")
+           .constantArgumentType("varchar")
+           .argumentType("date")
+           .build()});
 
-      return FunctionSignatureBuilder()
-          .integerVariable("a_precision")
-          .integerVariable("a_scale")
-          .integerVariable("b_precision")
-          .integerVariable("b_scale")
-          .integerVariable("r_precision", rPrecisionConstraint)
-          .integerVariable("r_scale", rScaleConstraint)
-          .returnType("decimal(r_precision, r_scale)")
-          .argumentType("decimal(a_precision, a_scale)")
-          .argumentType("decimal(b_precision, b_scale)")
-          .build();
-    };
+  registerCudfFunction(
+      prefix + "divide",
+      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<BinaryFunction>(
+            expr, cudf::binary_operator::DIV);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("double")
+           .argumentType("double")
+           .build()});
 
-    registerCudfFunctions(
-        aliases,
-        [op](
-            const std::string&,
-            const std::shared_ptr<velox::exec::Expr>& expr) {
-          return std::make_shared<BinaryFunction>(expr, op);
-        },
-        {FunctionSignatureBuilder()
-             .returnType("double")
-             .argumentType("double")
-             .argumentType("double")
-             .build(),
-         decimalBinarySignature(op)});
-  };
-
-  registerBinaryOp(
-      {prefix + "plus", prefix + "add"}, cudf::binary_operator::ADD);
-  registerBinaryOp(
-      {prefix + "minus", prefix + "subtract"}, cudf::binary_operator::SUB);
-  registerBinaryOp({prefix + "multiply"}, cudf::binary_operator::MUL);
-  registerBinaryOp({prefix + "divide"}, cudf::binary_operator::DIV);
-  registerBinaryOp({prefix + "mod"}, cudf::binary_operator::MOD);
-
-  //
-  // regular comparison operators
-  //
+  const std::vector<exec::FunctionSignaturePtr> comparisonSignatures{
+      FunctionSignatureBuilder()
+          .returnType("boolean")
+          .argumentType("double")
+          .argumentType("double")
+          .build(),
+      FunctionSignatureBuilder()
+          .returnType("boolean")
+          .argumentType("timestamp")
+          .argumentType("timestamp")
+          .build(),
+      FunctionSignatureBuilder()
+          .returnType("boolean")
+          .argumentType("date")
+          .argumentType("date")
+          .build()};
 
   auto registerComparisonOp = [&](const std::vector<std::string>& aliases,
                                   cudf::binary_operator op) {
@@ -1731,26 +1936,14 @@ bool registerBuiltinFunctions(const std::string& prefix) {
             const std::shared_ptr<velox::exec::Expr>& expr) {
           return std::make_shared<BinaryFunction>(expr, op);
         },
-        {FunctionSignatureBuilder()
-             .returnType("boolean")
-             .argumentType("double")
-             .argumentType("double")
-             .build(),
-         FunctionSignatureBuilder()
-             .integerVariable("a_precision")
-             .integerVariable("a_scale")
-             .integerVariable("b_precision")
-             .integerVariable("b_scale")
-             .returnType("boolean")
-             .argumentType("decimal(a_precision, a_scale)")
-             .argumentType("decimal(b_precision, b_scale)")
-             .build()});
+        comparisonSignatures);
   };
 
   registerComparisonOp(
-      {prefix + "equal", prefix + "eq"}, cudf::binary_operator::EQUAL);
+      {prefix + "equalto", prefix + "eq"}, cudf::binary_operator::EQUAL);
   registerComparisonOp(
-      {prefix + "notequal", prefix + "neq"}, cudf::binary_operator::NOT_EQUAL);
+      {prefix + "notequalto", prefix + "neq"},
+      cudf::binary_operator::NOT_EQUAL);
   registerComparisonOp(
       {prefix + "greaterthanorequal", prefix + "gte"},
       cudf::binary_operator::GREATER_EQUAL);
@@ -1762,105 +1955,17 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   registerComparisonOp(
       {prefix + "lessthan", prefix + "lt"}, cudf::binary_operator::LESS);
 
-  //
-  // regular unary operators
-  //
-
-  auto registerUnaryOp = [&](const std::vector<std::string>& aliases,
-                             cudf::unary_operator op) {
-    registerCudfFunctions(
-        aliases,
-        [op](
-            const std::string&,
-            const std::shared_ptr<velox::exec::Expr>& expr) {
-          return std::make_shared<UnaryFunction>(expr, op);
-        },
-        {FunctionSignatureBuilder()
-             .returnType("double")
-             .argumentType("double")
-             .build(),
-         FunctionSignatureBuilder()
-             .integerVariable("p")
-             .integerVariable("s")
-             .returnType("decimal(p,s)")
-             .argumentType("decimal(p,s)")
-             .build()});
-  };
-
-  registerUnaryOp({prefix + "abs"}, cudf::unary_operator::ABS);
-  registerUnaryOp({prefix + "negate"}, cudf::unary_operator::NEGATE);
-  registerUnaryOp({prefix + "floor"}, cudf::unary_operator::FLOOR);
-  registerUnaryOp({prefix + "ceil"}, cudf::unary_operator::CEIL);
-
-  // @TODO (seves 1/28/26)
-  // truncate
-  // no direct cudf mapping
-  // perhaps a compound operation using round/round_decimal
-
-  //
-  // between
-  //
-
   registerCudfFunction(
       prefix + "between",
       [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
         return std::make_shared<BetweenFunction>(expr);
       },
       {FunctionSignatureBuilder()
+           .typeVariable("T")
            .returnType("boolean")
-           .argumentType("double")
-           .argumentType("double")
-           .argumentType("double")
-           .build(),
-       FunctionSignatureBuilder()
-           .integerVariable("p")
-           .integerVariable("s")
-           .returnType("boolean")
-           .argumentType("decimal(p,s)")
-           .argumentType("decimal(p,s)")
-           .argumentType("decimal(p,s)")
-           .build()});
-
-  //
-  // greatest & least
-  //
-
-  registerCudfFunction(
-      prefix + "greatest",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
-        return std::make_shared<GreatestLeastFunction>(
-            expr, cudf::binary_operator::NULL_MAX);
-      },
-      {FunctionSignatureBuilder()
-           .returnType("double")
-           .argumentType("double")
-           .variableArity("double")
-           .build(),
-       FunctionSignatureBuilder()
-           .integerVariable("p")
-           .integerVariable("s")
-           .returnType("decimal(p,s)")
-           .argumentType("decimal(p,s)")
-           .variableArity("decimal(p,s)")
-           .build()});
-
-  registerCudfFunction(
-      prefix + "least",
-      [](const std::string&, const std::shared_ptr<velox::exec::Expr>& expr) {
-        return std::make_shared<GreatestLeastFunction>(
-            expr, cudf::binary_operator::NULL_MIN);
-      },
-      {FunctionSignatureBuilder()
-           .returnType("double")
-           .argumentType("double")
-           .variableArity("double")
-           .build(),
-       FunctionSignatureBuilder()
-           .integerVariable("p")
-           .integerVariable("s")
-           .returnType("decimal(p,s)")
-           .argumentType("decimal(p,s)")
-           .variableArity("decimal(p,s)")
+           .argumentType("T")
+           .argumentType("T")
+           .argumentType("T")
            .build()});
 
   return true;
@@ -1895,10 +2000,84 @@ ColumnOrView FunctionExpression::eval(
     bool finalize) {
   using velox::exec::FieldReference;
 
+  if (expr_->name() == "literal") {
+    LOG(WARNING) << "FunctionExpression::eval for LITERAL expr="
+                 << expr_->toString() << " type=" << expr_->type()->toString();
+  }
+
   if (auto fieldExpr = std::dynamic_pointer_cast<FieldReference>(expr_)) {
     auto name = fieldExpr->name();
     auto columnIndex = inputRowSchema_->getChildIdx(name);
     return inputColumnViews[columnIndex];
+  }
+
+  if (auto constExpr =
+          std::dynamic_pointer_cast<velox::exec::ConstantExpr>(expr_)) {
+    cudf::size_type numRows =
+        inputColumnViews.empty() ? 1 : inputColumnViews[0].size();
+    auto cudfType = cudf_velox::veloxToCudfDataType(expr_->type());
+    auto value = constExpr->value();
+    LOG(WARNING) << "ConstantExpr eval: type=" << expr_->type()->toString()
+                 << " isNull=" << value->isNullAt(0) << " rows=" << numRows;
+    if (value->isNullAt(0)) {
+      std::unique_ptr<cudf::scalar> nullScalar;
+      switch (expr_->type()->kind()) {
+        case TypeKind::BOOLEAN:
+          nullScalar = std::make_unique<cudf::numeric_scalar<bool>>(
+              false, false, stream, mr);
+          break;
+        case TypeKind::INTEGER:
+          nullScalar = std::make_unique<cudf::numeric_scalar<int32_t>>(
+              0, false, stream, mr);
+          break;
+        case TypeKind::BIGINT:
+          nullScalar = std::make_unique<cudf::numeric_scalar<int64_t>>(
+              0, false, stream, mr);
+          break;
+        case TypeKind::DOUBLE:
+          nullScalar = std::make_unique<cudf::numeric_scalar<double>>(
+              0.0, false, stream, mr);
+          break;
+        case TypeKind::VARCHAR:
+          nullScalar =
+              std::make_unique<cudf::string_scalar>("", false, stream, mr);
+          break;
+        default:
+          nullScalar = cudf::make_numeric_scalar(cudfType, stream, mr);
+          nullScalar->set_valid_async(false, stream);
+          break;
+      }
+      return cudf::make_column_from_scalar(*nullScalar, numRows, stream, mr);
+    }
+    std::unique_ptr<cudf::scalar> scalar;
+    switch (expr_->type()->kind()) {
+      case TypeKind::BOOLEAN:
+        scalar = std::make_unique<cudf::numeric_scalar<bool>>(
+            value->as<SimpleVector<bool>>()->valueAt(0), true, stream, mr);
+        break;
+      case TypeKind::INTEGER:
+        scalar = std::make_unique<cudf::numeric_scalar<int32_t>>(
+            value->as<SimpleVector<int32_t>>()->valueAt(0), true, stream, mr);
+        break;
+      case TypeKind::BIGINT:
+        scalar = std::make_unique<cudf::numeric_scalar<int64_t>>(
+            value->as<SimpleVector<int64_t>>()->valueAt(0), true, stream, mr);
+        break;
+      case TypeKind::DOUBLE:
+        scalar = std::make_unique<cudf::numeric_scalar<double>>(
+            value->as<SimpleVector<double>>()->valueAt(0), true, stream, mr);
+        break;
+      case TypeKind::VARCHAR:
+        scalar = std::make_unique<cudf::string_scalar>(
+            value->as<SimpleVector<StringView>>()->valueAt(0).str(),
+            true, stream, mr);
+        break;
+      default:
+        scalar = cudf::make_numeric_scalar(cudfType, stream, mr);
+        scalar->set_valid_async(true, stream);
+        break;
+    }
+    return cudf::make_column_from_scalar(*scalar, numRows, stream, mr);
   }
 
   if (function_) {
@@ -1911,7 +2090,8 @@ ColumnOrView FunctionExpression::eval(
 
     auto result = function_->eval(subexprResults, stream, mr);
     if (finalize) {
-      const auto requestedType = cudf_velox::veloxToCudfDataType(expr_->type());
+      const auto requestedType =
+          cudf_velox::veloxToCudfDataType(expr_->type());
       auto resultView = asView(result);
       if (resultView.type() != requestedType) {
         return cudf::cast(resultView, requestedType, stream, mr);
@@ -1931,8 +2111,13 @@ void FunctionExpression::close() {
 
 bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
   using velox::exec::FieldReference;
+  using velox::exec::ConstantExpr;
 
   if (std::dynamic_pointer_cast<FieldReference>(expr)) {
+    return true;
+  }
+
+  if (std::dynamic_pointer_cast<velox::exec::ConstantExpr>(expr)) {
     return true;
   }
 
@@ -1947,6 +2132,44 @@ bool FunctionExpression::canEvaluate(std::shared_ptr<velox::exec::Expr> expr) {
     auto src = cudf_velox::veloxToCudfDataType(srcType);
     auto dst = cudf_velox::veloxToCudfDataType(dstType);
     return cudf::is_supported_cast(src, dst);
+  }
+
+  if (opName == "and" || opName == "or") {
+    if (expr->inputs().size() < 2) {
+      return false;
+    }
+    for (const auto& input : expr->inputs()) {
+      if (input->type()->kind() != TypeKind::BOOLEAN) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if (endsWith(opName, "date_trunc")) {
+    if (expr->inputs().size() != 2) {
+      return false;
+    }
+    auto unitExpr =
+        std::dynamic_pointer_cast<velox::exec::ConstantExpr>(expr->inputs()[0]);
+    if (!unitExpr || unitExpr->value()->isNullAt(0)) {
+      return false;
+    }
+    auto unit = normalizeDateTruncUnit(unitExpr->value()->toString(0));
+    const auto& inputType = expr->inputs()[1]->type();
+    const bool isTimestamp = inputType->isTimestamp();
+    const bool isDate = inputType->isDate();
+    if (!isTimestamp && !isDate) {
+      return false;
+    }
+    if (unit == "second" || unit == "minute" || unit == "hour") {
+      return isTimestamp;
+    }
+    if (unit == "day" || unit == "week" || unit == "month" ||
+        unit == "quarter" || unit == "year") {
+      return true;
+    }
+    return false;
   }
 
   auto& registry = getCudfFunctionRegistry();
@@ -2002,6 +2225,15 @@ std::shared_ptr<CudfExpression> createCudfExpression(
         best = &entry;
       }
     }
+  }
+
+  if (expr->name() == "literal") {
+    LOG(WARNING) << "createCudfExpression for LITERAL: type="
+                 << expr->type()->toString()
+                 << " best=" << (best ? "found" : "none")
+                 << " isConstantExpr="
+                 << (std::dynamic_pointer_cast<velox::exec::ConstantExpr>(expr)
+                         != nullptr);
   }
 
   if (best != nullptr) {

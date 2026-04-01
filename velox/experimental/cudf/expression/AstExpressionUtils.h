@@ -20,6 +20,7 @@
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 #include "velox/experimental/cudf/expression/AstExpression.h"
+#include "velox/experimental/cudf/expression/AstTypeUtils.h"
 #include "velox/experimental/cudf/expression/AstUtils.h"
 // TODO(kn): in another PR
 // #include "velox/experimental/cudf/CudfNoDefaults.h"
@@ -226,15 +227,8 @@ bool isAstExprSupported(const std::shared_ptr<velox::exec::Expr>& expr) {
   using velox::exec::FieldReference;
   using Op = cudf::ast::ast_operator;
 
-  // For now, AST does not support expressions with DECIMAL output, or immediate
-  // DECIMAL inputs.
-  // @TODO implement DECIMAL in AST and JIT
-  if (containsDecimalType(expr, false)) {
-    if (cudf_velox::CudfConfig::getInstance().debugEnabled) {
-      LOG(WARNING)
-          << "Expression contains DECIMAL type, which is not supported by AST/JIT: "
-          << expr->toString();
-    }
+  if (containsAstUnsupportedType(expr)) {
+    LOG(WARNING) << "Expression not supported by AST/JIT: " << expr->toString();
     return false;
   }
 
@@ -562,7 +556,9 @@ cudf::ast::expression const& AstContext::pushExprToTree(
     } else if (expr->type()->kind() == TypeKind::DOUBLE) {
       return tree.push(Operation{Op::CAST_TO_FLOAT64, op1});
     } else {
-      VELOX_FAIL("Unsupported type for cast operation");
+      VELOX_FAIL(
+          "Unsupported type for cast operation: {}",
+          expr->type()->toString());
     }
   } else if (auto fieldExpr = std::dynamic_pointer_cast<FieldReference>(expr)) {
     // Refer to the appropriate side
@@ -585,12 +581,27 @@ cudf::ast::expression const& AstContext::pushExprToTree(
         }
       }
     }
+    {
+      std::string schemaInfo = "Schemas: ";
+      for (size_t i = 0; i < inputRowSchema.size(); ++i) {
+        schemaInfo += "[" + std::to_string(i) + "]: " +
+            inputRowSchema[i]->toString() + "; ";
+      }
+      LOG(ERROR) << "Field not found: name=" << name
+                 << " fieldName=" << fieldName << " " << schemaInfo;
+    }
     VELOX_FAIL("Field not found, " + name);
   } else if (!allowPureAstOnly && canBeEvaluatedByCudf(expr, /*deep=*/false)) {
     // Shallow check: only verify this operation is supported
     // Children will be recursively handled by createCudfExpression
     // Determine which side this expression references
     int sideIdx = findExpressionSide(expr);
+    if (sideIdx == -2) {
+      VELOX_FAIL(
+          "Expression references fields from multiple join sides, "
+          "cannot be precomputed: " +
+          name);
+    }
     if (sideIdx < 0) {
       sideIdx = 0; // Default to left side if no fields found
     }
@@ -604,14 +615,20 @@ cudf::ast::expression const& AstContext::pushExprToTree(
 
 int AstContext::findExpressionSide(
     const std::shared_ptr<velox::exec::Expr>& expr) const {
+  int foundSide = -1;
   for (const auto* field : expr->distinctFields()) {
     for (size_t sideIdx = 0; sideIdx < inputRowSchema.size(); ++sideIdx) {
       if (inputRowSchema[sideIdx].get()->containsChild(field->field())) {
-        return static_cast<int>(sideIdx);
+        if (foundSide == -1) {
+          foundSide = static_cast<int>(sideIdx);
+        } else if (foundSide != static_cast<int>(sideIdx)) {
+          return -2; // Fields span multiple sides
+        }
+        break;
       }
     }
   }
-  return -1;
+  return foundSide;
 }
 
 std::vector<ColumnOrView> precomputeSubexpressions(

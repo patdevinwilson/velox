@@ -199,6 +199,7 @@ RowVectorPtr toVeloxColumn(
   //
   // seves 1/17/26
 
+  stream.synchronize();
   auto arrowDeviceArray = cudf::to_arrow_host(table, stream, mr);
   ArrowArray arrayCopy = arrowDeviceArray->array;
   arrowDeviceArray->array.release = nullptr;
@@ -233,8 +234,11 @@ getMetadata(Iterator begin, Iterator end, const std::string& namePrefix) {
   int i = 0;
   for (auto c = begin; c < end; c++) {
     metadata.push_back(cudf::column_metadata(namePrefix + std::to_string(i)));
-    metadata.back().children_meta = getMetadata(
-        c->child_begin(), c->child_end(), namePrefix + std::to_string(i));
+    if (c->type().id() == cudf::type_id::STRUCT ||
+        c->type().id() == cudf::type_id::LIST) {
+      metadata.back().children_meta = getMetadata(
+          c->child_begin(), c->child_end(), namePrefix + std::to_string(i));
+    }
     i++;
   }
   return metadata;
@@ -269,9 +273,15 @@ RowVectorPtr toVeloxColumn(
     const std::vector<std::string>& columnNames,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) {
-  std::vector<cudf::column_metadata> metadata;
-  for (auto name : columnNames) {
-    metadata.emplace_back(cudf::column_metadata(name));
+  auto metadata = getMetadata(table.begin(), table.end(), "col_");
+  VELOX_CHECK_EQ(
+      metadata.size(),
+      columnNames.size(),
+      "Number of column names ({}) doesn't match number of table columns ({})",
+      columnNames.size(),
+      metadata.size());
+  for (size_t i = 0; i < columnNames.size(); ++i) {
+    metadata[i].name = columnNames[i];
   }
   return toVeloxColumn(table, pool, metadata, nullptr, stream, mr);
 }

@@ -26,7 +26,10 @@
 #include "velox/expression/FieldReference.h"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/column/column_factories.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/reduction.hpp>
+#include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/unary.hpp>
 
@@ -195,6 +198,7 @@ void CudfFilterProject::initialize() {
   const auto inputType = project_ ? project_->sources()[0]->outputType()
                                   : filter_->sources()[0]->outputType();
 
+
   // convert to AST
   if (CudfConfig::getInstance().debugEnabled) {
     int i = 0;
@@ -243,18 +247,62 @@ RowVectorPtr CudfFilterProject::getOutput() {
   }
 
   auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input_);
-  VELOX_CHECK_NOT_NULL(cudfInput);
+  if (!cudfInput) {
+    auto stream = cudfGlobalStreamPool().get_stream();
+    auto tbl = with_arrow::toCudfTable(
+        input_, input_->pool(), stream, get_output_mr());
+    stream.synchronize();
+    cudfInput = std::make_shared<CudfVector>(
+        input_->pool(), input_->type(), input_->size(),
+        std::move(tbl), stream);
+  }
   auto stream = cudfInput->stream();
   auto inputTableColumns = cudfInput->release()->release();
 
   if (hasFilter_) {
     filter(inputTableColumns, stream);
   }
+  vector_size_t filteredRowCount = 0;
+  if (!inputTableColumns.empty()) {
+    filteredRowCount = inputTableColumns.front()->size();
+  } else {
+    filteredRowCount = input_->size();
+  }
   auto outputColumns = project(inputTableColumns, stream);
 
+  if (outputColumns.empty()) {
+    if (filteredRowCount == 0) {
+      input_.reset();
+      return nullptr;
+    }
+    auto outputTable = std::make_unique<cudf::table>(std::move(outputColumns));
+    stream.synchronize();
+    if (CudfConfig::getInstance().debugEnabled) {
+      VLOG(1) << "cudfProject Output: " << filteredRowCount
+              << " rows, 0 columns";
+    }
+    auto cudfOutput = std::make_shared<CudfVector>(
+        input_->pool(),
+        outputType_,
+        filteredRowCount,
+        std::move(outputTable),
+        stream);
+    input_.reset();
+    return cudfOutput;
+  }
+
   auto outputTable = std::make_unique<cudf::table>(std::move(outputColumns));
+  stream.synchronize();
   auto const numColumns = outputTable->num_columns();
   auto const size = outputTable->num_rows();
+
+  // Debug: log null counts for boolean columns (Q38/Q87 INTERSECT debug)
+  for (cudf::size_type ci = 0; ci < numColumns; ++ci) {
+    auto col = outputTable->view().column(ci);
+    if (col.type().id() == cudf::type_id::BOOL8 && size > 0) {
+    }
+  }
+
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(1) << "cudfProject Output: " << size << " rows, " << numColumns
             << " columns";
@@ -263,7 +311,7 @@ RowVectorPtr CudfFilterProject::getOutput() {
   auto cudfOutput = std::make_shared<CudfVector>(
       input_->pool(), outputType_, size, std::move(outputTable), stream);
   input_.reset();
-  if (numColumns == 0 or size == 0) {
+  if (size == 0) {
     return nullptr;
   }
   return cudfOutput;
@@ -326,33 +374,26 @@ std::vector<std::unique_ptr<cudf::column>> CudfFilterProject::project(
   for (int i = 0; i < resultProjections_.size(); i++) {
     auto& columnOrView = columns[i];
     if (std::holds_alternative<std::unique_ptr<cudf::column>>(columnOrView)) {
-      // Move the owned column
       outputColumns[resultProjections_[i].outputChannel] =
           std::move(std::get<std::unique_ptr<cudf::column>>(columnOrView));
     } else {
-      // Materialize the column_view into an owned column
       auto view = std::get<cudf::column_view>(columnOrView);
       outputColumns[resultProjections_[i].outputChannel] =
           std::make_unique<cudf::column>(view, stream, get_output_mr());
     }
   }
 
-  // Count occurrences of each inputChannel, and move columns if they occur only
-  // once
   std::unordered_map<column_index_t, int> inputChannelCount;
   for (const auto& identity : identityProjections_) {
     inputChannelCount[identity.inputChannel]++;
   }
 
-  // identityProjections (input to output copy)
   for (auto const& identity : identityProjections_) {
     VELOX_CHECK_NOT_NULL(inputTableColumns[identity.inputChannel]);
     if (inputChannelCount[identity.inputChannel] == 1) {
-      // Move the column if it occurs only once
       outputColumns[identity.outputChannel] =
           std::move(inputTableColumns[identity.inputChannel]);
     } else {
-      // Otherwise, copy the column and decrement the count
       outputColumns[identity.outputChannel] = std::make_unique<cudf::column>(
           *inputTableColumns[identity.inputChannel], stream, get_output_mr());
     }

@@ -83,6 +83,7 @@ class CudfFilterProject : public exec::Operator, public NvtxHelper {
 
   std::vector<velox::exec::IdentityProjection> resultProjections_;
   std::vector<velox::exec::IdentityProjection> identityProjections_;
+
 };
 
 bool canBeEvaluatedByCudf(

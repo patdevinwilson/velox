@@ -37,6 +37,8 @@
 
 #include <cuda.h>
 
+#include <fmt/format.h>
+
 #include <iostream>
 
 static const std::string kCudfAdapterName = "cuDF";
@@ -100,9 +102,17 @@ bool CompileState::compile(bool allowCpuFallback) {
         OperatorProperties props;
         auto adapter = registry.findAdapter(op);
         props.adapter = adapter;
-        if (adapter && isValidPlanNodeId(op->planNodeId())) {
-          static_cast<OperatorAdapter::Properties&>(props) =
-              adapter->properties(op, getPlanNode(op->planNodeId()), ctx);
+        if (adapter) {
+          core::PlanNodePtr planNode = nullptr;
+          if (isValidPlanNodeId(op->planNodeId())) {
+            planNode = getPlanNode(op->planNodeId());
+          } else if (driverFactory_.consumerNode) {
+            planNode = driverFactory_.consumerNode;
+          }
+          if (planNode) {
+            static_cast<OperatorAdapter::Properties&>(props) =
+                adapter->properties(op, planNode, ctx);
+          }
         }
         if (isAnyOf<CudfOperator>(op)) {
           // CudfOperator is always fully GPU compatible
@@ -209,25 +219,38 @@ bool CompileState::compile(bool allowCpuFallback) {
     }
 
     if (debugEnabled) {
-      VLOG(1) << "Operator: ID " << oper->operatorId() << ": "
-              << oper->toString() << ", keepOperator = " << keepOperator
-              << ", isPureCpuOperator = " << isPureCpuOperator
-              << ", replaceOp.size() = " << replaceOp.size()
-              << ", previousOperatorIsNotGpu = " << previousOperatorIsNotGpu
-              << ", nextOperatorIsNotGpu = " << nextOperatorIsNotGpu
-              << ", isLastOperatorOfTask = " << isLastOperatorOfTask
-              << ", canRunOnGPU[" << operatorIndex
-              << "] = " << thisOpProps.canRunOnGPU << ", acceptsGpuInput["
-              << operatorIndex << "] = " << thisOpProps.acceptsGpuInput
-              << ", producesGpuOutput[" << operatorIndex
-              << "] = " << thisOpProps.producesGpuOutput
-              << ", planNode = " << bool(planNode);
+      LOG(INFO) << "Operator: ID " << oper->operatorId() << ": "
+                << oper->toString() << ", keepOperator = " << keepOperator
+                << ", isPureCpuOperator = " << isPureCpuOperator
+                << ", replaceOp.size() = " << replaceOp.size()
+                << ", previousOperatorIsNotGpu = " << previousOperatorIsNotGpu
+                << ", nextOperatorIsNotGpu = " << nextOperatorIsNotGpu
+                << ", isLastOperatorOfTask = " << isLastOperatorOfTask
+                << ", canRunOnGPU[" << operatorIndex
+                << "] = " << thisOpProps.canRunOnGPU << ", acceptsGpuInput["
+                << operatorIndex << "] = " << thisOpProps.acceptsGpuInput
+                << ", producesGpuOutput[" << operatorIndex
+                << "] = " << thisOpProps.producesGpuOutput
+                << ", planNode = " << bool(planNode);
+    }
+    if (isPureCpuOperator) {
+      LOG(WARNING) << "Replacement with cuDF operator failed. "
+                   << (allowCpuFallback ? "Falling back to CPU execution"
+                                        : "No fallback allowed");
+      LOG(WARNING) << "Replacement Failed Operator: " << oper->toString();
+      auto planNode = getPlanNode(oper->planNodeId());
+      LOG(WARNING) << "Replacement Failed PlanNode: "
+                   << planNode->toString(true, false);
     }
     if (!allowCpuFallback) {
       // condition is if GPU replacement success or if CPU operators itself is
       // GPU compatible. or if specific CPU operator is allowed even when
       // fallback is disabled.
-      VELOX_CHECK(!isPureCpuOperator, "Replacement with cuDF operator failed");
+      const auto failMsg = fmt::format(
+          "Replacement with cuDF operator failed. Operator: {}. PlanNode: {}",
+          oper->toString(),
+          planNode ? planNode->toString(true, false) : "N/A");
+      VELOX_CHECK(!isPureCpuOperator, failMsg);
     } else if (isPureCpuOperator) {
       LOG(WARNING)
           << "Replacement with cuDF operator failed. Falling back to CPU execution";
@@ -415,6 +438,11 @@ void CudfConfig::initialize(
   }
   if (config.find(kCudfFunctionEngine) != config.end()) {
     functionEngine = config[kCudfFunctionEngine];
+  }
+
+  if (config.find(kCudfEnableEnforceSingleRow) != config.end()) {
+    enableEnforceSingleRow =
+        folly::to<bool>(config[kCudfEnableEnforceSingleRow]);
   }
 }
 

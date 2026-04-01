@@ -19,6 +19,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/detail/valid_if.cuh>
 #include <cudf/null_mask.hpp>
+#include <cudf/unary.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/strings/utilities.hpp>
 #include <cudf/utilities/error.hpp>
@@ -346,13 +347,19 @@ std::unique_ptr<cudf::column> serializeDecimalSumState(
                 offsetsPtr,
                 charsPtr,
                 numRows);
-      } else {
-        CUDF_EXPECTS(
-            sumCol.type().id() == cudf::type_id::DECIMAL128,
-            "Unsupported decimal sum column type");
+      } else if (sumCol.type().id() == cudf::type_id::DECIMAL128) {
         packStateKernel<__int128_t, int64_t>
             <<<gridSize, blockSize, 0, stream.value()>>>(
                 sumCol.data<__int128_t>(),
+                countCol.data<int64_t>(),
+                offsetsPtr,
+                charsPtr,
+                numRows);
+      } else {
+        auto castCol = cudf::cast(sumCol, cudf::data_type{cudf::type_id::DECIMAL128, sumCol.type().scale()}, stream);
+        packStateKernel<__int128_t, int64_t>
+            <<<gridSize, blockSize, 0, stream.value()>>>(
+                castCol->view().data<__int128_t>(),
                 countCol.data<int64_t>(),
                 offsetsPtr,
                 charsPtr,
@@ -376,13 +383,19 @@ std::unique_ptr<cudf::column> serializeDecimalSumState(
                 offsetsPtr,
                 charsPtr,
                 numRows);
-      } else {
-        CUDF_EXPECTS(
-            sumCol.type().id() == cudf::type_id::DECIMAL128,
-            "Unsupported decimal sum column type");
+      } else if (sumCol.type().id() == cudf::type_id::DECIMAL128) {
         packStateKernel<__int128_t, int32_t>
             <<<gridSize, blockSize, 0, stream.value()>>>(
                 sumCol.data<__int128_t>(),
+                countCol.data<int64_t>(),
+                offsetsPtr,
+                charsPtr,
+                numRows);
+      } else {
+        auto castCol = cudf::cast(sumCol, cudf::data_type{cudf::type_id::DECIMAL128, sumCol.type().scale()}, stream);
+        packStateKernel<__int128_t, int32_t>
+            <<<gridSize, blockSize, 0, stream.value()>>>(
+                castCol->view().data<__int128_t>(),
                 countCol.data<int64_t>(),
                 offsetsPtr,
                 charsPtr,

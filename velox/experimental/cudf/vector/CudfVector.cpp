@@ -25,9 +25,6 @@
 #include <cudf/column/column.hpp>
 #include <cudf/table/table.hpp>
 
-#include "velox/experimental/cudf/exec/GpuResources.h"
-#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
-
 namespace facebook::velox::cudf_velox {
 namespace {
 
@@ -112,6 +109,23 @@ void logDefaultStreamIfNeeded(
 
 } // namespace
 
+namespace {
+std::vector<VectorPtr> createNullChildren(
+    velox::memory::MemoryPool* pool,
+    const TypePtr& type,
+    vector_size_t size) {
+  auto rowType = std::dynamic_pointer_cast<const RowType>(type);
+  if (!rowType) return {};
+  std::vector<VectorPtr> children;
+  children.reserve(rowType->size());
+  for (size_t i = 0; i < rowType->size(); ++i) {
+    children.push_back(
+        BaseVector::createNullConstant(rowType->childAt(i), size, pool));
+  }
+  return children;
+}
+} // namespace
+
 CudfVector::CudfVector(
     velox::memory::MemoryPool* pool,
     TypePtr type,
@@ -123,7 +137,7 @@ CudfVector::CudfVector(
           type,
           BufferPtr(nullptr),
           size,
-          materializeCpuChildren(pool, type, table->view(), stream),
+          createNullChildren(pool, type, size),
           std::nullopt),
       tableStorage_{std::move(table)},
       stream_{stream} {
@@ -143,10 +157,10 @@ CudfVector::CudfVector(
     rmm::cuda_stream_view stream)
     : RowVector(
           pool,
-          std::move(type),
+          type,
           BufferPtr(nullptr),
           size,
-          std::vector<VectorPtr>(),
+          createNullChildren(pool, type, size),
           std::nullopt),
       tableStorage_{std::move(packedTable)},
       stream_{stream} {
@@ -154,6 +168,7 @@ CudfVector::CudfVector(
   auto& packedPtr =
       std::get<std::unique_ptr<cudf::packed_table>>(tableStorage_);
   tabView_ = packedPtr->table;
+  // For packed table, flatSize is the size of the GPU data buffer
   flatSize_ = packedPtr->data.gpu_data->size();
 }
 
@@ -179,26 +194,6 @@ std::unique_ptr<cudf::table> CudfVector::release() {
 
 uint64_t CudfVector::estimateFlatSize() const {
   return flatSize_;
-}
-
-std::vector<VectorPtr> CudfVector::materializeCpuChildren(
-    velox::memory::MemoryPool* pool,
-    const TypePtr& type,
-    const cudf::table_view& tabView,
-    rmm::cuda_stream_view stream) {
-  auto rowType = std::dynamic_pointer_cast<const RowType>(type);
-  if (!rowType || tabView.num_columns() == 0) {
-    return {};
-  }
-  auto rowVec = with_arrow::toVeloxColumn(tabView, pool, rowType, "", stream,
-      get_output_mr());
-  std::vector<VectorPtr> result;
-  if (rowVec) {
-    for (column_index_t i = 0; i < rowVec->childrenSize(); ++i) {
-      result.push_back(rowVec->childAt(i));
-    }
-  }
-  return result;
 }
 
 } // namespace facebook::velox::cudf_velox

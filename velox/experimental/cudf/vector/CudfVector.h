@@ -71,11 +71,6 @@ class CudfVector : public RowVector {
   uint64_t estimateFlatSize() const override;
 
  private:
-  static std::vector<VectorPtr> materializeCpuChildren(
-      velox::memory::MemoryPool* pool,
-      const TypePtr& type,
-      const cudf::table_view& tabView,
-      rmm::cuda_stream_view stream);
   // Storage for either an owned table or packed table.
   // Only one is active at a time - using variant enforces this at compile time.
   using TableStorage = std::variant<

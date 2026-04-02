@@ -169,7 +169,7 @@ RowVectorPtr CudfLocalMerge::getOutput() {
       if (it->size() == 1) {
         return std::move(it->front());
       }
-      auto concatenated = getConcatenatedTable(*it, outputType_, stream, mr);
+      auto concatenated = getConcatenatedTable(std::move(*it), outputType_, stream, mr);
       auto numRows = concatenated->num_rows();
       return std::make_shared<CudfVector>(
           pool(), outputType_, numRows, std::move(concatenated), stream);

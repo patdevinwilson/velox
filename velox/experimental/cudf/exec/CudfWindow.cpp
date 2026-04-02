@@ -337,16 +337,22 @@ std::unique_ptr<cudf::column> CudfWindow::computeAggregateColumn(
        (isCurrentRowFollowing && sortKeyIndices_.empty()));
 
   if (isFullPartition) {
-    return cudf::grouped_rolling_window(
+    stream.synchronize();
+    auto result = cudf::grouped_rolling_window(
         partKeys, inputCol,
         cudf::window_bounds::unbounded(),
         cudf::window_bounds::unbounded(),
         1, *agg, stream, mr);
+    stream.synchronize();
+    return result;
   }
 
   auto [preceding, following] = toWindowBounds(func.frame);
-  return cudf::grouped_rolling_window(
+  stream.synchronize();
+  auto result = cudf::grouped_rolling_window(
       partKeys, inputCol, preceding, following, 1, *agg, stream, mr);
+  stream.synchronize();
+  return result;
 }
 
 void CudfWindow::noMoreInput() {
@@ -387,6 +393,7 @@ RowVectorPtr CudfWindow::getOutput() {
   } else {
     allData = cudf::concatenate(views, stream, mr);
   }
+  stream.synchronize();
   inputBatches_.clear();
 
   auto allView = allData->view();

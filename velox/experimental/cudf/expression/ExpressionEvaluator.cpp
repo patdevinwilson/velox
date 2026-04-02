@@ -935,14 +935,27 @@ class CoalesceFunction : public CudfFunction {
         !inputColumns.empty(),
         "coalesce requires at least one non-literal input");
     ColumnOrView result = asView(inputColumns[0]);
+    auto resultType = asView(result).type();
     size_t stop = std::min(numColumnsBeforeLiteral_, inputColumns.size());
     for (size_t i = 1; i < stop && asView(result).has_nulls(); ++i) {
-      result = cudf::replace_nulls(
-          asView(result), asView(inputColumns[i]), stream, mr);
+      auto nextCol = asView(inputColumns[i]);
+      if (nextCol.type() != resultType) {
+        auto casted = cudf::cast(nextCol, resultType, stream, mr);
+        result = cudf::replace_nulls(asView(result), casted->view(), stream, mr);
+      } else {
+        result = cudf::replace_nulls(asView(result), nextCol, stream, mr);
+      }
     }
 
     if (literalScalar_ && asView(result).has_nulls()) {
-      result = cudf::replace_nulls(asView(result), *literalScalar_, stream, mr);
+      if (literalScalar_->type() != resultType) {
+        auto litCol = cudf::make_column_from_scalar(*literalScalar_, 1, stream, mr);
+        auto casted = cudf::cast(litCol->view(), resultType, stream, mr);
+        auto newScalar = cudf::get_element(casted->view(), 0, stream, mr);
+        result = cudf::replace_nulls(asView(result), *newScalar, stream, mr);
+      } else {
+        result = cudf::replace_nulls(asView(result), *literalScalar_, stream, mr);
+      }
     }
 
     return result;

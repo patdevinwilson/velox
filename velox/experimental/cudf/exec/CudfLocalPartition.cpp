@@ -180,6 +180,7 @@ void CudfLocalPartition::enqueuePartition(
 }
 
 void CudfLocalPartition::addInput(RowVectorPtr input) {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   flushVectorPool();
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   recordOutputStats(input);

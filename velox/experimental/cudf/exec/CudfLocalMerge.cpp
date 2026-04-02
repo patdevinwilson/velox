@@ -107,6 +107,7 @@ bool CudfLocalMerge::isFinished() {
 }
 
 RowVectorPtr CudfLocalMerge::getOutput() {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
 
   if (finished_) {

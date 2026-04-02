@@ -53,11 +53,13 @@ bool CudfLimit::needsInput() const {
 }
 
 void CudfLimit::addInput(RowVectorPtr input) {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   VELOX_CHECK_NULL(input_);
   input_ = input;
 }
 
 RowVectorPtr CudfLimit::getOutput() {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   if (input_ == nullptr || (remainingOffset_ == 0 && remainingLimit_ == 0)) {
     return nullptr;

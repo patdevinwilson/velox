@@ -135,6 +135,7 @@ CudfFromVelox::CudfFromVelox(
           fmt::format("[{}]", planNodeId)) {}
 
 void CudfFromVelox::addInput(RowVectorPtr input) {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   if (input->size() > 0) {
     // Materialize lazy vectors
@@ -150,6 +151,7 @@ void CudfFromVelox::addInput(RowVectorPtr input) {
 }
 
 RowVectorPtr CudfFromVelox::getOutput() {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   const auto targetOutputSize =
       preferredGpuBatchSizeRows(operatorCtx_->driverCtx()->queryConfig());
@@ -239,6 +241,7 @@ bool CudfToVelox::isPassthroughMode() const {
 }
 
 void CudfToVelox::addInput(RowVectorPtr input) {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   // Accumulate inputs
   if (input->size() > 0) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
@@ -256,6 +259,7 @@ std::optional<uint64_t> CudfToVelox::averageRowSize() {
 }
 
 RowVectorPtr CudfToVelox::getOutput() {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   if (finished_ || inputs_.empty()) {
     finished_ = noMoreInput_ && inputs_.empty();

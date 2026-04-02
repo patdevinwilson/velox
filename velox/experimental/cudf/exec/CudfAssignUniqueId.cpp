@@ -51,6 +51,7 @@ CudfAssignUniqueId::CudfAssignUniqueId(
 }
 
 void CudfAssignUniqueId::addInput(RowVectorPtr input) {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   auto numInput = input->size();
   VELOX_CHECK_NE(
@@ -59,6 +60,7 @@ void CudfAssignUniqueId::addInput(RowVectorPtr input) {
 }
 
 RowVectorPtr CudfAssignUniqueId::getOutput() {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
 
   if (input_ == nullptr) {

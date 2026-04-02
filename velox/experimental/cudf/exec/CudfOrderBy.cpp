@@ -61,6 +61,7 @@ CudfOrderBy::CudfOrderBy(
 }
 
 void CudfOrderBy::addInput(RowVectorPtr input) {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   // Accumulate inputs
   if (input->size() > 0) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
@@ -95,6 +96,7 @@ void CudfOrderBy::noMoreInput() {
 }
 
 RowVectorPtr CudfOrderBy::getOutput() {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   if (finished_ || !noMoreInput_) {
     return nullptr;
   }

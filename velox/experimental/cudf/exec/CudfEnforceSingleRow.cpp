@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/exec/CudfEnforceSingleRow.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
@@ -45,6 +46,7 @@ bool CudfEnforceSingleRow::needsInput() const {
 }
 
 void CudfEnforceSingleRow::addInput(RowVectorPtr input) {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
 
   if (CudfConfig::getInstance().debugEnabled) {
@@ -105,6 +107,7 @@ void CudfEnforceSingleRow::noMoreInput() {
 }
 
 RowVectorPtr CudfEnforceSingleRow::getOutput() {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
 
   if (CudfConfig::getInstance().debugEnabled) {

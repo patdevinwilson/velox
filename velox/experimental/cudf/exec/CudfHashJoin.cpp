@@ -242,6 +242,7 @@ CudfHashJoinBuild::CudfHashJoinBuild(
 }
 
 void CudfHashJoinBuild::addInput(RowVectorPtr input) {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(2) << "Calling CudfHashJoinBuild::addInput";
   }
@@ -269,6 +270,7 @@ bool CudfHashJoinBuild::needsInput() const {
 }
 
 RowVectorPtr CudfHashJoinBuild::getOutput() {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   return nullptr;
 }
 

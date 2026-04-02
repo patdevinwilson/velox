@@ -17,6 +17,7 @@
 #include "velox/experimental/cudf/exec/CudfWindow.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
 #include "velox/core/Expressions.h"
 
@@ -473,6 +474,17 @@ RowVectorPtr CudfWindow::getOutput() {
   }
 
   // 4. Build the output table: input columns + window result columns.
+  // Cast window result columns to match expected output types.
+  auto inputColCount = windowNode_->inputType()->size();
+  for (size_t i = 0; i < windowResultCols.size(); ++i) {
+    auto expectedType = cudf_velox::veloxToCudfDataType(
+        outputType_->childAt(inputColCount + i));
+    if (windowResultCols[i]->type() != expectedType) {
+      windowResultCols[i] = cudf::cast(
+          windowResultCols[i]->view(), expectedType, stream, mr);
+    }
+  }
+
   auto& dataOwner = sortedData ? sortedData : allData;
   auto sortedCols = dataOwner->release();
   for (auto& wc : windowResultCols) {

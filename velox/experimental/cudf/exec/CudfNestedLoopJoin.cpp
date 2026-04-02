@@ -98,6 +98,7 @@ CudfNestedLoopJoinBuild::CudfNestedLoopJoinBuild(
       joinNode_(joinNode) {}
 
 void CudfNestedLoopJoinBuild::addInput(RowVectorPtr input) {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   if (input->size() > 0) {
     auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
     if (!cudfInput) {
@@ -238,6 +239,7 @@ bool CudfNestedLoopJoinProbe::needsInput() const {
 }
 
 void CudfNestedLoopJoinProbe::addInput(RowVectorPtr input) {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   VELOX_CHECK_NULL(input_);
   input_ = std::move(input);
   buildBatchIdx_ = 0;
@@ -350,6 +352,7 @@ RowVectorPtr CudfNestedLoopJoinProbe::crossJoinWithBuildBatch(
 }
 
 RowVectorPtr CudfNestedLoopJoinProbe::getOutput() {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   if (input_ == nullptr) {
     if (!noMoreInput_) {

@@ -40,6 +40,7 @@ CudfBatchConcat::CudfBatchConcat(
       targetRows_(CudfConfig::getInstance().batchSizeMinThreshold) {}
 
 void CudfBatchConcat::addInput(RowVectorPtr input) {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   auto cudfVector = std::dynamic_pointer_cast<CudfVector>(input);
   VELOX_CHECK_NOT_NULL(cudfVector, "CudfBatchConcat expects CudfVector input");
 
@@ -49,6 +50,7 @@ void CudfBatchConcat::addInput(RowVectorPtr input) {
 }
 
 RowVectorPtr CudfBatchConcat::getOutput() {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   // Drain the queue if there is any output to be flushed
   if (!outputQueue_.empty()) {

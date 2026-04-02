@@ -68,6 +68,8 @@ RowVectorPtr CudfBatchConcat::getOutput() {
         outputType_,
         outputQueueStream_,
         get_output_mr());
+
+
     currentNumRows_ = 0;
 
     for (auto it = tables.begin(); it + 1 != tables.end(); ++it) {

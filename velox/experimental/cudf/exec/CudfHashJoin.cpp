@@ -520,6 +520,7 @@ bool CudfHashJoinProbe::needsInput() const {
 }
 
 void CudfHashJoinProbe::addInput(RowVectorPtr input) {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   if (skipInput_) {
     VELOX_CHECK_NULL(input_);
     return;
@@ -1710,6 +1711,7 @@ std::vector<std::unique_ptr<cudf::table>> CudfHashJoinProbe::antiJoin(
 }
 
 RowVectorPtr CudfHashJoinProbe::getOutput() {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   if (CudfConfig::getInstance().debugEnabled) {
     VLOG(2) << "Calling CudfHashJoinProbe::getOutput";
   }

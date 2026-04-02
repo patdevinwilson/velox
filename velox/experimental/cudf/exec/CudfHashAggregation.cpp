@@ -1597,6 +1597,7 @@ void CudfHashAggregation::computeSingleGroupbyStreaming(CudfVectorPtr tbl) {
 
 void CudfHashAggregation::addInput(RowVectorPtr input) {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   if (input->size() == 0) {
     return;
   }
@@ -1768,6 +1769,7 @@ CudfVectorPtr CudfHashAggregation::releaseAndResetPartialOutput() {
 
 RowVectorPtr CudfHashAggregation::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
 
   // Handle partial groupby and distinct.
   if (isPartialOutput_ && !isGlobal_ && streamingEnabled_) {

@@ -101,6 +101,7 @@ std::unique_ptr<cudf::table> getConcatenatedTable(
   // the wrong stream.
   auto output = cudf::concatenate(tableViews, stream, mr);
 
+  // Order input deallocations after the concatenate read.
   // Since memory resources are stream-ordered, deallocations
   // on inputStreams will be ordered after the concatenate completes.
   CudaEvent event(cudaEventDisableTiming);

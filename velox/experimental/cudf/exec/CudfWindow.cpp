@@ -15,6 +15,7 @@
  */
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/CudfWindow.h"
+#include "velox/experimental/cudf/exec/GpuResources.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 
 #include "velox/core/Expressions.h"
@@ -23,6 +24,8 @@
 #include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/gather.hpp>
+#include <cudf/unary.hpp>
+#include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/groupby.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/rolling.hpp>
@@ -307,6 +310,7 @@ std::unique_ptr<cudf::column> CudfWindow::computeAggregateColumn(
     const std::string& baseName,
     rmm::cuda_stream_view stream) const {
   auto mr = cudf::get_current_device_resource_ref();
+
   std::unique_ptr<cudf::rolling_aggregation> agg;
   if (baseName == "sum") {
     agg = cudf::make_sum_aggregation<cudf::rolling_aggregation>();
@@ -368,6 +372,7 @@ bool CudfWindow::isFinished() {
 
 RowVectorPtr CudfWindow::getOutput() {
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
 
   if (finished_ || !noMoreInput_) {
     return nullptr;

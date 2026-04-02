@@ -232,10 +232,12 @@ void CudfFilterProject::initialize() {
 }
 
 void CudfFilterProject::addInput(RowVectorPtr input) {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   input_ = std::move(input);
 }
 
 RowVectorPtr CudfFilterProject::getOutput() {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
 
   if (allInputProcessed()) {

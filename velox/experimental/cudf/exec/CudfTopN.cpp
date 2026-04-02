@@ -93,17 +93,21 @@ CudfVectorPtr CudfTopN::mergeTopK(
       cudf::merge(tableViews, sortKeys_, columnOrder_, nullOrder_, stream, mr);
   // Ensure input-stream deallocations don't race with merge stream.
   streamsWaitForStream(*cudaEvent_, inputStreams, stream);
+  stream.synchronize();
   // slice it
   auto topk =
       cudf::split(
           mergedTable->view(), {std::min(k, mergedTable->num_rows())}, stream)
           .front();
+  stream.synchronize();
   auto const size = topk.num_rows();
+  auto resultTable = std::make_unique<cudf::table>(topk, stream, mr);
+  stream.synchronize();
   return std::make_shared<CudfVector>(
       topNBatches[0]->pool(),
       outputType_,
       size,
-      std::make_unique<cudf::table>(topk, stream, mr),
+      std::move(resultTable),
       stream);
 }
 
@@ -118,13 +122,16 @@ std::unique_ptr<cudf::table> CudfTopN::getTopK(
   auto const kIndices =
       cudf::split(indices->view(), {std::min(k, indices->size())}, stream)
           .front();
-  return cudf::detail::gather(
+  stream.synchronize();
+  auto result = cudf::detail::gather(
       values,
       kIndices,
       cudf::out_of_bounds_policy::DONT_CHECK,
       cudf::detail::negative_index_policy::NOT_ALLOWED,
       stream,
       mr);
+  stream.synchronize();
+  return result;
 }
 
 // helper to get topk of a table

@@ -162,10 +162,15 @@ class FilterProjectAdapter : public OperatorAdapter {
     auto filterNode = filterProjectOp->filterNode();
 
     if (projectPlanNode) {
-      if (projectPlanNode->sources()[0]->outputType()->size() == 0 ||
-          projectPlanNode->outputType()->size() == 0) {
+      if (projectPlanNode->sources()[0]->outputType()->size() == 0) {
+                     << planNode->id() << " outputSize="
+                     << projectPlanNode->outputType()->size();
         return false;
       }
+    }
+    if (!projectPlanNode && !filterNode) {
+                   << planNode->id();
+      return false;
     }
 
     // Check filter separately

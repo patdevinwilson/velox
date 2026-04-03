@@ -47,7 +47,7 @@ class CudfFilterProject : public exec::Operator, public NvtxHelper {
 
   RowVectorPtr getOutput() override;
 
-  void filter(
+  cudf::size_type filter(
       std::vector<std::unique_ptr<cudf::column>>& inputTableColumns,
       rmm::cuda_stream_view stream);
 

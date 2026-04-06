@@ -141,6 +141,7 @@ CudfVectorPtr CudfTopN::getTopKBatch(CudfVectorPtr cudfInput, int32_t k) {
 }
 
 void CudfTopN::addInput(RowVectorPtr input) {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   if (count_ == 0 || input->size() == 0) {
     return;
@@ -171,6 +172,7 @@ void CudfTopN::addInput(RowVectorPtr input) {
 }
 
 RowVectorPtr CudfTopN::getOutput() {
+  std::lock_guard<std::mutex> lock(cudfGlobalMutex());
   VELOX_NVTX_OPERATOR_FUNC_RANGE();
   if (finished_ || !noMoreInput_) {
     return nullptr;

@@ -22,6 +22,7 @@
 #include <rmm/resource_ref.hpp>
 
 #include <memory>
+#include <mutex>
 #include <string_view>
 
 namespace facebook::velox::cudf_velox {
@@ -46,5 +47,10 @@ createMemoryResource(std::string_view mode, int percent);
  * @brief Returns the global CUDA stream pool used by cudf.
  */
 [[nodiscard]] cudf::detail::cuda_stream_pool& cudfGlobalStreamPool();
+
+/// Global mutex for serializing GPU operator calls.
+/// cuDF is not thread-safe when multiple CPU threads call into it
+/// concurrently on the same CUDA stream.
+std::mutex& cudfGlobalMutex();
 
 } // namespace facebook::velox::cudf_velox

@@ -1330,16 +1330,15 @@ TypePtr parseDecimalFormat(const std::string_view format) {
     int precision = std::stoi(&format[2], &sz);
     int scale = std::stoi(&format[firstCommaIdx + 1], &sz);
     if (secondCommaIdx != std::string_view::npos) {
-      // BitWidth is provided. We only support 64 or 128.
+      // BitWidth is provided. Promote narrower types to Velox's supported widths.
       int bitWidth = std::stoi(&format[secondCommaIdx + 1], &sz);
-      // Return type depends on bitWidth.
-      if (bitWidth == 64) {
+      if (bitWidth <= 64) {
         return std::make_shared<ShortDecimalType>(precision, scale);
-      } else if (bitWidth == 128) {
+      } else if (bitWidth <= 128) {
         return std::make_shared<LongDecimalType>(precision, scale);
       }
       VELOX_USER_FAIL(
-          "Conversion failed for '{}'. Only 64-bit and 128-bit decimal types are supported.",
+          "Conversion failed for '{}'. Only decimal types up to 128-bit are supported.",
           format);
     }
     // Otherwise return type depends on precision.

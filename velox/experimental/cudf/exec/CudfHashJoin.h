@@ -188,8 +188,14 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
   RowTypePtr probeType_;
   /** @brief Row type for build table (needed for precomputation) */
   RowTypePtr buildType_;
-  /** @brief Cached evaluator for post-join filter column */
+  /** @brief Cached evaluator for post-join filter column (lazy init) */
   std::shared_ptr<CudfExpression> filterEvaluator_;
+  /** @brief Concatenated probe+build type for filter evaluation */
+  RowTypePtr filterConcatType_;
+  /** @brief Whether filter has been lazily initialized */
+  bool filterInitialized_{false};
+
+  void ensureFilterInitialized();
 
   bool rightPrecomputed_{false};
 
@@ -228,8 +234,9 @@ class CudfHashJoinProbe : public exec::Operator, public NvtxHelper {
 
   /** @brief CUDA stream from build operator for synchronization */
   std::optional<rmm::cuda_stream_view> buildStream_;
-  /** @brief CUDA event for coordinating stream synchronization */
+  /** @brief CUDA event for coordinating stream synchronization (lazy init) */
   std::unique_ptr<CudaEvent> cudaEvent_;
+  CudaEvent& cudaEvent();
 
   // Streaming right join state
   // Per-build-table flags indicating whether a build row has had at least one

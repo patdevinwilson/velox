@@ -139,9 +139,27 @@ std::shared_ptr<rmm::mr::device_memory_resource> createMemoryResource(
       "managed_pool, prefetch_managed_pool, managed_async, prefetch_managed_async");
 }
 
-cudf::detail::cuda_stream_pool& cudfGlobalStreamPool() {
-  return cudf::detail::global_cuda_stream_pool();
+class SingleStreamPool : public cudf::detail::cuda_stream_pool {
+ public:
+  SingleStreamPool() : stream_(cudf::get_default_stream()) {}
+  rmm::cuda_stream_view get_stream() override { return stream_; }
+  rmm::cuda_stream_view get_stream(stream_id_type) override { return stream_; }
+  std::vector<rmm::cuda_stream_view> get_streams(
+      std::size_t) override { return {stream_}; }
+  std::size_t get_stream_pool_size() const override { return 1; }
+ private:
+  rmm::cuda_stream_view stream_;
 };
+
+cudf::detail::cuda_stream_pool& cudfGlobalStreamPool() {
+  static SingleStreamPool pool;
+  return pool;
+};
+
+std::mutex& cudfGlobalMutex() {
+  static std::mutex mtx;
+  return mtx;
+}
 
 std::shared_ptr<rmm::mr::device_memory_resource> mr_;
 std::shared_ptr<rmm::mr::device_memory_resource> output_mr_;

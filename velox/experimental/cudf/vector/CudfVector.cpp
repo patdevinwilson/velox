@@ -109,6 +109,23 @@ void logDefaultStreamIfNeeded(
 
 } // namespace
 
+namespace {
+std::vector<VectorPtr> createNullChildren(
+    velox::memory::MemoryPool* pool,
+    const TypePtr& type,
+    vector_size_t size) {
+  auto rowType = std::dynamic_pointer_cast<const RowType>(type);
+  if (!rowType) return {};
+  std::vector<VectorPtr> children;
+  children.reserve(rowType->size());
+  for (size_t i = 0; i < rowType->size(); ++i) {
+    children.push_back(
+        BaseVector::createNullConstant(rowType->childAt(i), size, pool));
+  }
+  return children;
+}
+} // namespace
+
 CudfVector::CudfVector(
     velox::memory::MemoryPool* pool,
     TypePtr type,
@@ -117,10 +134,10 @@ CudfVector::CudfVector(
     rmm::cuda_stream_view stream)
     : RowVector(
           pool,
-          std::move(type),
+          type,
           BufferPtr(nullptr),
           size,
-          std::vector<VectorPtr>(),
+          createNullChildren(pool, type, size),
           std::nullopt),
       tableStorage_{std::move(table)},
       stream_{stream} {
@@ -140,10 +157,10 @@ CudfVector::CudfVector(
     rmm::cuda_stream_view stream)
     : RowVector(
           pool,
-          std::move(type),
+          type,
           BufferPtr(nullptr),
           size,
-          std::vector<VectorPtr>(),
+          createNullChildren(pool, type, size),
           std::nullopt),
       tableStorage_{std::move(packedTable)},
       stream_{stream} {

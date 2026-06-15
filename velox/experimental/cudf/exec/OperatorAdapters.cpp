@@ -1014,22 +1014,18 @@ class WindowAdapter : public OperatorAdapter {
           baseName == "count" || baseName == "avg";
 
       if (usesFrame) {
-        // Check frame type - RANGE with non-trivial bounds is not supported.
-        // Only these RANGE combinations are supported (equivalent to ROWS):
-        // - UNBOUNDED PRECEDING to CURRENT ROW
-        // - UNBOUNDED PRECEDING to UNBOUNDED FOLLOWING
+        // GPU path implements ROWS-based semantics only.  RANGE frames require
+        // peer-aware handling for ORDER BY ties: e.g.
+        //   RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        // must include every row whose ORDER BY value equals the current row's,
+        // not just the rows up to the current position.  Until peer-group
+        // semantics are implemented and tested on the GPU, fall back to CPU for
+        // all RANGE frames.
         if (func.frame.type == core::WindowNode::WindowType::kRange) {
-          bool startOk = func.frame.startType ==
-              core::WindowNode::BoundType::kUnboundedPreceding;
-          bool endOk = func.frame.endType ==
-                  core::WindowNode::BoundType::kUnboundedFollowing ||
-              func.frame.endType == core::WindowNode::BoundType::kCurrentRow;
-          if (!startOk || !endOk) {
-            LOG_FALLBACK(
-                "RANGE frame with non-unbounded/current bounds not supported, PlanNode id: {}",
-                planNode->id());
-            return false;
-          }
+          LOG_FALLBACK(
+              "RANGE frame requires peer-aware semantics not yet implemented on GPU, PlanNode id: {}",
+              planNode->id());
+          return false;
         }
 
         // Check for non-constant frame bounds (column references).

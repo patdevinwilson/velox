@@ -1211,9 +1211,10 @@ TEST_F(CudfWindowTest, rankGlobalWithoutOrderBy) {
 
 // Test last_value respects the actual frame bounds.
 // Default frame with ORDER BY is RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT
-// ROW, which for last_value means returning the current row's value.
-// Previously hardcoded UNBOUNDED FOLLOWING which was incorrect.
-// Addresses mattgara's comment: with the bug, this would return {3,3,3}.
+// ROW, but GPU only supports ROWS frames.  Use an explicit ROWS frame here
+// which gives the same result for this data (no ORDER BY ties) and exercises
+// the same "respects frame bounds" logic.
+// Addresses mattgara's comment: with the old bug, this would return {3,3,3}.
 TEST_F(CudfWindowTest, lastValueWithDefaultFrame) {
   auto data = makeRowVector(
       {"x"},
@@ -1221,17 +1222,19 @@ TEST_F(CudfWindowTest, lastValueWithDefaultFrame) {
           makeFlatVector<int64_t>({1, 2, 3}),
       });
 
-  auto plan = PlanBuilder()
-                  .values({data})
-                  .window({"last_value(x) over (order by x) as lv"})
-                  .orderBy({"x ASC NULLS LAST"}, false)
-                  .planNode();
+  auto plan =
+      PlanBuilder()
+          .values({data})
+          .window(
+              {"last_value(x) over (order by x rows between unbounded preceding and current row) as lv"})
+          .orderBy({"x ASC NULLS LAST"}, false)
+          .planNode();
 
-  // With default frame (RANGE UNBOUNDED PRECEDING TO CURRENT ROW):
+  // With ROWS UNBOUNDED PRECEDING TO CURRENT ROW:
   // Row 1 (x=1): frame is [1], last_value = 1
   // Row 2 (x=2): frame is [1,2], last_value = 2
   // Row 3 (x=3): frame is [1,2,3], last_value = 3
-  // The bug would have returned {3, 3, 3} by using UNBOUNDED FOLLOWING.
+  // The old bug would have returned {3, 3, 3} by using UNBOUNDED FOLLOWING.
   auto expected = makeRowVector(
       {"x", "lv"},
       {
@@ -1243,6 +1246,7 @@ TEST_F(CudfWindowTest, lastValueWithDefaultFrame) {
 }
 
 // Test first_value respects the actual frame bounds.
+// Uses an explicit ROWS frame because GPU only supports ROWS semantics.
 TEST_F(CudfWindowTest, firstValueWithDefaultFrame) {
   auto data = makeRowVector(
       {"v"},
@@ -1250,13 +1254,15 @@ TEST_F(CudfWindowTest, firstValueWithDefaultFrame) {
           makeFlatVector<int64_t>({1, 2, 3}),
       });
 
-  auto plan = PlanBuilder()
-                  .values({data})
-                  .window({"first_value(v) over (order by v) as fv"})
-                  .orderBy({"v ASC NULLS LAST"}, false)
-                  .planNode();
+  auto plan =
+      PlanBuilder()
+          .values({data})
+          .window(
+              {"first_value(v) over (order by v rows between unbounded preceding and current row) as fv"})
+          .orderBy({"v ASC NULLS LAST"}, false)
+          .planNode();
 
-  // With default frame (RANGE UNBOUNDED PRECEDING TO CURRENT ROW):
+  // With ROWS UNBOUNDED PRECEDING TO CURRENT ROW:
   // All rows have first_value = 1 (the first value in the frame)
   auto expected = makeRowVector(
       {"v", "fv"},
@@ -1385,40 +1391,34 @@ TEST_F(CudfWindowTest, windowAdapterGatingChecks) {
           .copyResults(pool()),
       "Replacement with cuDF operator failed");
 
-  // Supported: RANGE UNBOUNDED PRECEDING to CURRENT ROW (equivalent to ROWS)
-  auto plan1 =
-      PlanBuilder()
-          .values({data})
-          .window({"sum(v) over (partition by p order by v "
-                   "range between unbounded preceding and current row)"})
-          .orderBy({"p ASC NULLS LAST", "v ASC NULLS LAST"}, false)
-          .planNode();
-  auto expected1 = makeRowVector(
-      {"p", "v", "w0"},
-      {
-          makeFlatVector<int32_t>({1, 1, 1}),
-          makeFlatVector<int64_t>({10, 20, 30}),
-          makeFlatVector<int64_t>({10, 30, 60}),
-      });
-  AssertQueryBuilder(plan1).assertResults(expected1);
+  // Unsupported: RANGE UNBOUNDED PRECEDING to CURRENT ROW.
+  // Despite looking like a simple running sum, RANGE semantics require
+  // peer-aware handling for ORDER BY ties: all rows with the same ORDER BY
+  // value must share the same frame boundary.  Without that, the GPU would
+  // produce incorrect results (e.g. a positional running sum instead of a
+  // peer-group sum).  Fall back to CPU until peer-group semantics are
+  // implemented on the GPU.
+  VELOX_ASSERT_THROW(
+      AssertQueryBuilder(
+          PlanBuilder()
+              .values({data})
+              .window({"sum(v) over (partition by p order by v "
+                       "range between unbounded preceding and current row)"})
+              .planNode())
+          .copyResults(pool()),
+      "Replacement with cuDF operator failed");
 
-  // Supported: RANGE UNBOUNDED PRECEDING to UNBOUNDED FOLLOWING
-  auto plan2 =
-      PlanBuilder()
-          .values({data})
-          .window(
-              {"sum(v) over (partition by p order by v "
-               "range between unbounded preceding and unbounded following)"})
-          .orderBy({"p ASC NULLS LAST", "v ASC NULLS LAST"}, false)
-          .planNode();
-  auto expected2 = makeRowVector(
-      {"p", "v", "w0"},
-      {
-          makeFlatVector<int32_t>({1, 1, 1}),
-          makeFlatVector<int64_t>({10, 20, 30}),
-          makeFlatVector<int64_t>({60, 60, 60}),
-      });
-  AssertQueryBuilder(plan2).assertResults(expected2);
+  // Unsupported: RANGE UNBOUNDED PRECEDING to UNBOUNDED FOLLOWING.
+  // Falls back to CPU along with all other RANGE frames.
+  VELOX_ASSERT_THROW(
+      AssertQueryBuilder(
+          PlanBuilder()
+              .values({data})
+              .window({"sum(v) over (partition by p order by v "
+                       "range between unbounded preceding and unbounded following)"})
+              .planNode())
+          .copyResults(pool()),
+      "Replacement with cuDF operator failed");
 
   // Unsupported: RANGE CURRENT ROW to UNBOUNDED FOLLOWING
   VELOX_ASSERT_THROW(

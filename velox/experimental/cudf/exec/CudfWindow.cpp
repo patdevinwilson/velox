@@ -26,6 +26,7 @@
 #include "velox/type/Type.h"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
@@ -46,6 +47,8 @@
 #include <limits>
 #include <optional>
 #include <utility>
+
+#include <cuda_runtime_api.h>
 
 namespace facebook::velox::cudf_velox {
 
@@ -305,6 +308,141 @@ std::unique_ptr<cudf::column> computeGlobalAggregate(
   return cudf::make_column_from_scalar(*resultScalar, numRows, stream, mr);
 }
 
+template <typename T>
+T readColumnElement(
+    cudf::column_view column,
+    cudf::size_type index,
+    rmm::cuda_stream_view stream) {
+  T value{};
+  VELOX_CHECK_LT(index, column.size());
+  cudaMemcpyAsync(
+      &value,
+      column.data<T>() + index,
+      sizeof(T),
+      cudaMemcpyDeviceToHost,
+      stream.value());
+  stream.synchronize();
+  return value;
+}
+
+std::vector<cudf::size_type> findPartitionStartRows(
+    cudf::table_view input,
+    const std::vector<cudf::size_type>& partitionKeyIndices,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  std::vector<cudf::size_type> starts{0};
+  if (input.num_rows() <= 1 || partitionKeyIndices.empty()) {
+    return starts;
+  }
+
+  auto partKeys = input.select(partitionKeyIndices);
+  cudf::groupby::groupby grouper(
+      partKeys,
+      cudf::null_policy::INCLUDE,
+      cudf::sorted::YES,
+      std::vector<cudf::order>(
+          partitionKeyIndices.size(), cudf::order::ASCENDING),
+      std::vector<cudf::null_order>(
+          partitionKeyIndices.size(), cudf::null_order::BEFORE));
+
+  cudf::groupby::aggregation_request request;
+  request.values = partKeys.column(0);
+  request.aggregations.push_back(
+      cudf::make_count_aggregation<cudf::groupby_aggregation>(
+          cudf::null_policy::INCLUDE));
+  std::vector<cudf::groupby::aggregation_request> requests{std::move(request)};
+  auto aggregateResult = grouper.aggregate(
+      cudf::host_span<cudf::groupby::aggregation_request const>(
+          requests.data(), requests.size()),
+      stream,
+      mr);
+  auto& countCol = aggregateResult.second[0].results[0];
+  const auto numGroups = countCol->size();
+  if (numGroups <= 1) {
+    return starts;
+  }
+
+  cudf::size_type offset = 0;
+  for (cudf::size_type group = 0; group + 1 < numGroups; ++group) {
+    offset += readColumnElement<int64_t>(countCol->view(), group, stream);
+    starts.push_back(offset);
+  }
+  return starts;
+}
+
+bool partitionKeysEqual(
+    cudf::table_view left,
+    cudf::size_type leftRow,
+    cudf::table_view right,
+    cudf::size_type rightRow,
+    const std::vector<cudf::size_type>& partitionKeyIndices,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  for (auto keyIdx : partitionKeyIndices) {
+    auto leftSlice = cudf::slice(
+        left.column(keyIdx),
+        {static_cast<cudf::size_type>(leftRow),
+         static_cast<cudf::size_type>(leftRow + 1)},
+        stream);
+    auto rightSlice = cudf::slice(
+        right.column(keyIdx),
+        {static_cast<cudf::size_type>(rightRow),
+         static_cast<cudf::size_type>(rightRow + 1)},
+        stream);
+    auto equalCol = cudf::binary_operation(
+        leftSlice.front(),
+        rightSlice.front(),
+        cudf::binary_operator::EQUAL,
+        cudf::data_type(cudf::type_id::BOOL8),
+        stream,
+        mr);
+    if (!readColumnElement<bool>(equalCol->view(), 0, stream)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+CudfVectorPtr sliceCudfVector(
+    memory::MemoryPool* pool,
+    const CudfVectorPtr& input,
+    cudf::size_type start,
+    cudf::size_type end,
+    rmm::device_async_resource_ref mr) {
+  if (start >= end) {
+    return nullptr;
+  }
+  auto stream = input->stream();
+  auto sliced = cudf::slice(
+      input->getTableView(),
+      {static_cast<int>(start), static_cast<int>(end)},
+      stream);
+  auto table =
+      std::make_unique<cudf::table>(sliced.front(), stream, mr);
+  return std::make_shared<CudfVector>(
+      pool, input->type(), end - start, std::move(table), stream);
+}
+
+bool partitionKeysMatchLastToFirst(
+    const std::vector<CudfVectorPtr>& current,
+    const CudfVectorPtr& batch,
+    const std::vector<cudf::size_type>& partitionKeyIndices,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  VELOX_CHECK(!current.empty());
+  auto lastBatch = current.back();
+  auto lastView = lastBatch->getTableView();
+  auto batchView = batch->getTableView();
+  return partitionKeysEqual(
+      lastView,
+      lastView.num_rows() - 1,
+      batchView,
+      0,
+      partitionKeyIndices,
+      stream,
+      mr);
+}
+
 // Convert Velox frame bounds to cudf window bounds.
 cudf::window_bounds toWindowBound(
     core::WindowNode::BoundType type,
@@ -542,7 +680,9 @@ CudfWindow::CudfWindow(
           nvtx3::rgb{255, 165, 0},
           NvtxMethodFlag::kAddInput | NvtxMethodFlag::kGetOutput),
       windowNode_(windowNode),
-      inputRowType_(asRowType(windowNode->inputType())) {
+      inputRowType_(asRowType(windowNode->inputType())),
+      usePartitionStreaming_(
+          windowNode->inputsSorted() && !windowNode->partitionKeys().empty()) {
   const auto& inputType = windowNode->inputType();
 
   for (const auto& key : windowNode->partitionKeys()) {
@@ -565,11 +705,67 @@ CudfWindow::CudfWindow(
 }
 
 void CudfWindow::doAddInput(RowVectorPtr input) {
-  // Queue inputs, process all at once.
-  if (input->size() > 0) {
-    auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
-    VELOX_CHECK_NOT_NULL(cudfInput, "CudfWindow expects CudfVector input");
-    inputBatches_.push_back(std::move(cudfInput));
+  if (input->size() == 0) {
+    return;
+  }
+  auto cudfInput = std::dynamic_pointer_cast<CudfVector>(input);
+  VELOX_CHECK_NOT_NULL(cudfInput, "CudfWindow expects CudfVector input");
+  if (usePartitionStreaming_) {
+    addStreamingInput(std::move(cudfInput));
+    return;
+  }
+  inputBatches_.push_back(std::move(cudfInput));
+}
+
+void CudfWindow::finalizeCurrentPartition() {
+  if (currentPartitionBatches_.empty()) {
+    return;
+  }
+  if (!stream_.value()) {
+    stream_ = cudfGlobalStreamPool().get_stream();
+  }
+  auto partitionTable = getConcatenatedTable(
+      std::move(currentPartitionBatches_),
+      inputRowType_,
+      stream_,
+      get_output_mr());
+  completedPartitions_.push_back(std::move(partitionTable));
+}
+
+void CudfWindow::addStreamingInput(CudfVectorPtr batch) {
+  if (!stream_.value()) {
+    stream_ = cudfGlobalStreamPool().get_stream();
+  }
+  auto mr = get_output_mr();
+  auto view = batch->getTableView();
+  const auto numRows = view.num_rows();
+  const auto boundaries = findPartitionStartRows(
+      view, partitionKeyIndices_, stream_, mr);
+
+  for (size_t boundaryIndex = 0; boundaryIndex < boundaries.size();
+       ++boundaryIndex) {
+    const auto segmentStart = boundaries[boundaryIndex];
+    const auto segmentEnd = (boundaryIndex + 1 < boundaries.size())
+        ? boundaries[boundaryIndex + 1]
+        : numRows;
+
+    const bool continuesPreviousPartition = boundaryIndex == 0 &&
+        segmentStart == 0 && !currentPartitionBatches_.empty() &&
+        partitionKeysMatchLastToFirst(
+            currentPartitionBatches_, batch, partitionKeyIndices_, stream_, mr);
+
+    if (!continuesPreviousPartition && !currentPartitionBatches_.empty()) {
+      finalizeCurrentPartition();
+    }
+
+    if (auto segment = sliceCudfVector(
+            pool(), batch, segmentStart, segmentEnd, mr)) {
+      currentPartitionBatches_.push_back(std::move(segment));
+    }
+
+    if (boundaryIndex + 1 < boundaries.size()) {
+      finalizeCurrentPartition();
+    }
   }
 }
 
@@ -907,6 +1103,14 @@ std::unique_ptr<cudf::column> CudfWindow::computeAggregateColumn(
 
 void CudfWindow::doNoMoreInput() {
   Operator::noMoreInput();
+  if (usePartitionStreaming_) {
+    finalizeCurrentPartition();
+    if (completedPartitions_.empty()) {
+      finished_ = true;
+    }
+    return;
+  }
+
   if (inputBatches_.empty()) {
     finished_ = true;
     return;
@@ -965,17 +1169,11 @@ bool CudfWindow::isFinished() {
   return finished_;
 }
 
-RowVectorPtr CudfWindow::doGetOutput() {
-  if (finished_ || !noMoreInput_) {
-    return nullptr;
-  }
-  if (!sortedData_) {
-    finished_ = true;
-    return nullptr;
-  }
-
-  auto mr = get_output_mr();
-  auto sortedView = sortedData_->view();
+RowVectorPtr CudfWindow::processWindowOnTable(
+    std::unique_ptr<cudf::table> sortedData,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  auto sortedView = sortedData->view();
 
   // Build partition key table for grouped_rolling_window.
   auto partKeys = sortedView.select(partitionKeyIndices_);
@@ -1028,7 +1226,7 @@ RowVectorPtr CudfWindow::doGetOutput() {
           baseName);
       auto inputCol = sortedView.column(*inputColIdx);
       windowResultCols[funcIndex] =
-          computeLeadLagColumn(partKeys, inputCol, func, baseName, stream_);
+          computeLeadLagColumn(partKeys, inputCol, func, baseName, stream);
     } else if (baseName == "first_value" || baseName == "last_value") {
       auto inputColIdx = resolveInputChannel(func, inputRowType_);
       VELOX_CHECK(
@@ -1055,7 +1253,7 @@ RowVectorPtr CudfWindow::doGetOutput() {
             PendingRangeRolling{funcIndex, inputCol, std::move(agg)});
       } else {
         windowResultCols[funcIndex] = computeNthValueColumn(
-            partKeys, sortedView, inputCol, func, baseName, stream_, mr);
+            partKeys, sortedView, inputCol, func, baseName, stream, mr);
       }
     } else if (
         baseName == "sum" || baseName == "min" || baseName == "max" ||
@@ -1079,7 +1277,7 @@ RowVectorPtr CudfWindow::doGetOutput() {
             baseName,
             isCountStar,
             sortedView.num_rows(),
-            stream_,
+            stream,
             mr);
       } else if (auto rangeTypes = toBatchRangeWindowTypes(func, isFullPartition)) {
         std::unique_ptr<cudf::rolling_aggregation> agg;
@@ -1109,7 +1307,7 @@ RowVectorPtr CudfWindow::doGetOutput() {
             func,
             baseName,
             isCountStar,
-            stream_,
+            stream,
             mr);
       }
     } else {
@@ -1122,7 +1320,7 @@ RowVectorPtr CudfWindow::doGetOutput() {
       pendingRanks,
       rankGrouper.get(),
       windowResultCols,
-      stream_,
+      stream,
       mr);
 
   if (!rangeRollingBatches.empty()) {
@@ -1131,7 +1329,7 @@ RowVectorPtr CudfWindow::doGetOutput() {
         sortKeyIndices_,
         sortOrders_,
         nullOrders_,
-        stream_,
+        stream,
         mr);
     for (auto& batch : rangeRollingBatches) {
       auto& pendingRequests = batch.requests;
@@ -1149,7 +1347,7 @@ RowVectorPtr CudfWindow::doGetOutput() {
             batch.preceding,
             batch.following,
             rollingRequests,
-            stream_,
+            stream,
             mr);
         auto resultCols = batchResult->release();
         VELOX_CHECK_EQ(resultCols.size(), pendingRequests.size());
@@ -1169,16 +1367,13 @@ RowVectorPtr CudfWindow::doGetOutput() {
             func,
             std::move(pending.agg),
             isFullPartition,
-            stream_,
+            stream,
             mr);
       }
     }
   }
 
-  // Build the output table: input columns + window result columns.
-  // Cast window result columns to expected output types if needed.
-  auto sortedCols = sortedData_->release();
-  sortedData_.reset();
+  auto sortedCols = sortedData->release();
   const auto numInputCols = inputRowType_->size();
   for (size_t i = 0; i < windowResultCols.size(); ++i) {
     auto& wc = windowResultCols[i];
@@ -1186,16 +1381,55 @@ RowVectorPtr CudfWindow::doGetOutput() {
     auto expectedType =
         veloxToCudfDataType(outputType_->childAt(numInputCols + i));
     if (wc->type() != expectedType) {
-      wc = cudf::cast(wc->view(), expectedType, stream_, mr);
+      wc = cudf::cast(wc->view(), expectedType, stream, mr);
     }
     sortedCols.push_back(std::move(wc));
   }
   auto resultTable = std::make_unique<cudf::table>(std::move(sortedCols));
   auto resultSize = resultTable->num_rows();
 
-  finished_ = true;
   return std::make_shared<CudfVector>(
-      pool(), outputType_, resultSize, std::move(resultTable), stream_);
+      pool(), outputType_, resultSize, std::move(resultTable), stream);
+}
+
+RowVectorPtr CudfWindow::doGetOutput() {
+  if (finished_) {
+    return nullptr;
+  }
+
+  if (usePartitionStreaming_) {
+    if (completedPartitions_.empty()) {
+      if (noMoreInput_) {
+        finished_ = true;
+      }
+      return nullptr;
+    }
+    if (!stream_.value()) {
+      stream_ = cudfGlobalStreamPool().get_stream();
+    }
+    auto partitionTable = std::move(completedPartitions_.front());
+    completedPartitions_.pop_front();
+    auto result = processWindowOnTable(
+        std::move(partitionTable), stream_, get_output_mr());
+    if (completedPartitions_.empty() && noMoreInput_ &&
+        currentPartitionBatches_.empty()) {
+      finished_ = true;
+    }
+    return result;
+  }
+
+  if (!noMoreInput_) {
+    return nullptr;
+  }
+  if (!sortedData_) {
+    finished_ = true;
+    return nullptr;
+  }
+
+  auto result =
+      processWindowOnTable(std::move(sortedData_), stream_, get_output_mr());
+  finished_ = true;
+  return result;
 }
 
 void CudfWindow::doClose() {
@@ -1203,6 +1437,8 @@ void CudfWindow::doClose() {
   // Release GPU allocations only after pending work on stream_ completes.
   stream_.synchronize();
   inputBatches_.clear();
+  currentPartitionBatches_.clear();
+  completedPartitions_.clear();
   sortedData_.reset();
 }
 

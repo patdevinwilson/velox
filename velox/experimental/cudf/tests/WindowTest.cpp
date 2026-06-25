@@ -455,6 +455,34 @@ TEST_F(CudfWindowTest, rowNumberMultiBatch) {
   AssertQueryBuilder(plan).assertResults(expected);
 }
 
+// Phase 1 partition streaming (#17917): inputsSorted + partition keys process
+// one partition per output batch with partition boundaries detected in addInput.
+TEST_F(CudfWindowTest, partitionStreamingMultiBatch) {
+  auto data = makeRowVector(
+      {"id", "val"},
+      {
+          makeFlatVector<int32_t>({1, 1, 1, 2, 2, 2}),
+          makeFlatVector<int64_t>({10, 20, 30, 15, 25, 35}),
+      });
+
+  auto plan =
+      PlanBuilder()
+          .values(split(data, 3))
+          .streamingWindow({"row_number() over (partition by id order by val)"})
+          .orderBy({"id ASC NULLS LAST", "val ASC NULLS LAST"}, false)
+          .planNode();
+
+  auto expected = makeRowVector(
+      {"id", "val", "w0"},
+      {
+          makeFlatVector<int32_t>({1, 1, 1, 2, 2, 2}),
+          makeFlatVector<int64_t>({10, 20, 30, 15, 25, 35}),
+          makeFlatVector<int64_t>({1, 2, 3, 1, 2, 3}),
+      });
+
+  AssertQueryBuilder(plan).assertResults(expected);
+}
+
 TEST_F(CudfWindowTest, multiFunctionPartitionOrder) {
   // Same shape as valuesRowsStreamingWindowBuild (CPU) but non-streaming window
   // and explicit expected vectors (no DuckDB runner).

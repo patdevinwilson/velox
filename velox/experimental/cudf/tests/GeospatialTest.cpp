@@ -408,5 +408,32 @@ TEST_F(CudfGeospatialTest, stLengthLineStringQ7Shape) {
   EXPECT_NEAR(dists->valueAt(2), d2, 1e-6);
 }
 
+TEST_F(CudfGeospatialTest, stLineStringAllowsDuplicatePoints) {
+  // Sedona ST_MakeLine / SpatialBench Q7 parity: consecutive duplicate points
+  // are valid; ST_Length of the zero-length segment is 0.
+  std::vector<std::string> pickups = {makeWkbPoint(1.0, 2.0)};
+  std::vector<std::string> dropoffs = {makeWkbPoint(1.0, 2.0)};
+  std::vector<StringView> pickupViews;
+  std::vector<StringView> dropoffViews;
+  pickupViews.emplace_back(pickups[0]);
+  dropoffViews.emplace_back(dropoffs[0]);
+  auto data = makeRowVector(
+      {"pickup", "dropoff"},
+      {makeFlatVector<StringView>(pickupViews, VARBINARY()),
+       makeFlatVector<StringView>(dropoffViews, VARBINARY())});
+
+  auto plan =
+      PlanBuilder()
+          .values({data})
+          .project(
+              {"ST_Length(ST_LineString(ARRAY[ST_GeomFromBinary(pickup), ST_GeomFromBinary(dropoff)]))"})
+          .planNode();
+
+  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto lengths = result->childAt(0)->asFlatVector<double>();
+  ASSERT_EQ(lengths->size(), 1);
+  EXPECT_NEAR(lengths->valueAt(0), 0.0, 1e-12);
+}
+
 } // namespace
 

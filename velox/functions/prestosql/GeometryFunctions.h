@@ -2090,7 +2090,7 @@ struct StLineStringFunction {
       const arg_type<Array<Geometry>>& input) {
     std::unique_ptr<geos::geom::CoordinateArraySequence> coords =
         common::geospatial::GeometryDeserializer::deserializePointsToCoordinate<
-            Geometry>(input, "ST_LineString", true);
+            Geometry>(input, "ST_LineString", /*forbidDuplicates=*/false);
 
     std::unique_ptr<geos::geom::LineString> lineString;
     if (input.size() < 2) {

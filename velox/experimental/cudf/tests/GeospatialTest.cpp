@@ -254,5 +254,45 @@ TEST_F(CudfGeospatialTest, stGeomFromBinaryAndQ1Shape) {
   AssertQueryBuilder(plan).assertResults(expected);
 }
 
+TEST_F(CudfGeospatialTest, stDistancePointConstantPolygon) {
+  // SpatialBench Q3 shape: point vs constant axis-aligned POLYGON.
+  // POLYGON((-111.9060 34.7347, -111.6160 34.7347, -111.6160 35.0047,
+  //          -111.9060 35.0047, -111.9060 34.7347))
+  std::vector<std::string> owned = {
+      makeWkbPoint(-111.0, 34.8), // outside to the east
+      makeWkbPoint(-111.76, 34.87), // inside
+      makeWkbPoint(-111.7610, 34.7000), // south of box
+  };
+  std::vector<StringView> views;
+  for (const auto& s : owned) {
+    views.emplace_back(s);
+  }
+  auto data = makeRowVector(
+      {"pickup"}, {makeFlatVector<StringView>(views, VARBINARY())});
+
+  const char* poly =
+      "POLYGON((-111.9060 34.7347, -111.6160 34.7347, -111.6160 35.0047, -111.9060 35.0047, -111.9060 34.7347))";
+  std::string distExpr =
+      "ST_Distance(ST_GeomFromBinary(pickup), ST_GeometryFromText('" +
+      std::string(poly) + "'))";
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .project({distExpr})
+                  .planNode();
+
+  // East of xmax=-111.6160 at y=34.8 (inside y-range): dx=0.616
+  double dEast = -111.0 - (-111.6160);
+  // Inside → 0
+  // South of ymin=34.7347 at x=-111.761 (inside x-range): dy=0.0347
+  double dSouth = 34.7347 - 34.7000;
+
+  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto dists = result->childAt(0)->asFlatVector<double>();
+  ASSERT_EQ(dists->size(), 3);
+  EXPECT_NEAR(dists->valueAt(0), dEast, 1e-9);
+  EXPECT_NEAR(dists->valueAt(1), 0.0, 1e-12);
+  EXPECT_NEAR(dists->valueAt(2), dSouth, 1e-9);
+}
+
 } // namespace
 

@@ -66,6 +66,8 @@
 #include <cudf/transform.hpp>
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/error.hpp>
+#include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/traits.hpp>
 
 #include <rmm/device_scalar.hpp>
@@ -2245,23 +2247,41 @@ class StGeomFromBinaryFunction : public CudfFunction {
   }
 };
 
-/// Phase-1 point-point Euclidean ST_Distance (degree-space, matches CPU for
-/// POINT inputs). Non-POINT inputs raise a user error. Supports a constant
-/// geometry on either side (SpatialBench Q1 center point).
+/// Phase-1 ST_Distance: POINT–POINT, or POINT vs constant POLYGON/ENVELOPE
+/// (SpatialBench Q3). Supports a constant geometry on either side.
 class StDistanceFunction : public CudfFunction {
  public:
+  struct GpuPolygon {
+    rmm::device_uvector<double> xy;
+    rmm::device_uvector<int32_t> partEnds;
+    int32_t numParts{0};
+    int32_t numPoints{0};
+
+    GpuPolygon(
+        std::size_t xyCount,
+        std::size_t partCount,
+        rmm::cuda_stream_view stream,
+        rmm::device_async_resource_ref mr)
+        : xy(xyCount, stream, mr),
+          partEnds(partCount, stream, mr),
+          numParts(static_cast<int32_t>(partCount)),
+          numPoints(static_cast<int32_t>(xyCount / 2)) {}
+
+    DevicePolygonView view() const {
+      return DevicePolygonView{
+          xy.data(), partEnds.data(), numParts, numPoints};
+    }
+  };
+
   StDistanceFunction(
       const core::TypedExprPtr& expr,
       memory::MemoryPool* pool) {
     VELOX_CHECK_EQ(expr->inputs().size(), 2, "ST_Distance expects 2 inputs");
     if (expr->inputs()[0]->isConstantKind()) {
-      leftScalar_ = makeScalarFromConstantExpr(expr->inputs()[0], pool);
+      initConstant(expr->inputs()[0], pool, /*polygonOnLeft=*/true);
     } else if (expr->inputs()[1]->isConstantKind()) {
-      rightScalar_ = makeScalarFromConstantExpr(expr->inputs()[1], pool);
+      initConstant(expr->inputs()[1], pool, /*polygonOnLeft=*/false);
     }
-    VELOX_CHECK(
-        !(leftScalar_ && rightScalar_),
-        "ST_Distance on two constant geometries is not supported on GPU");
   }
 
   ColumnOrView eval(
@@ -2269,6 +2289,16 @@ class StDistanceFunction : public CudfFunction {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     rmm::device_scalar<int32_t> invalid(0, stream, mr);
+
+    if (constPolygon_) {
+      VELOX_CHECK_EQ(inputColumns.size(), 1);
+      auto points = asView(inputColumns[0]);
+      auto out = pointToConstantPolygonDistance(
+          points, constPolygon_->view(), invalid.data(), stream, mr);
+      throwIfInvalidGeometryType(invalid, stream);
+      return out;
+    }
+
     std::unique_ptr<cudf::column> leftCol;
     std::unique_ptr<cudf::column> rightCol;
     cudf::column_view leftView;
@@ -2292,15 +2322,74 @@ class StDistanceFunction : public CudfFunction {
       rightView = asView(inputColumns[1]);
     }
 
-    auto out = pointPointDistance(
-        leftView, rightView, invalid.data(), stream, mr);
+    auto out =
+        pointPointDistance(leftView, rightView, invalid.data(), stream, mr);
     throwIfInvalidGeometryType(invalid, stream);
     return out;
   }
 
  private:
+  void initConstant(
+      const core::TypedExprPtr& constantExpr,
+      memory::MemoryPool* pool,
+      bool polygonOnLeft) {
+    auto vec = toConstantVector(constantExpr, pool);
+    VELOX_CHECK(!vec->isNullAt(0), "ST_Distance constant geometry is null");
+    auto sv = vec->as<SimpleVector<StringView>>()->valueAt(0);
+    std::string_view bytes(sv.data(), sv.size());
+    VELOX_CHECK(!bytes.empty(), "ST_Distance constant geometry is empty");
+
+    auto tag = static_cast<uint8_t>(bytes[0]);
+    constexpr uint8_t kPointTag = 0;
+    constexpr uint8_t kPolygonTag = 4;
+    constexpr uint8_t kEnvelopeTag = 7;
+
+    if (tag == kPolygonTag || tag == kEnvelopeTag) {
+      std::vector<double> xy;
+      std::vector<int32_t> partEnds;
+      VELOX_CHECK(
+          parseVeloxPolygon(bytes, xy, partEnds),
+          "ST_Distance GPU supports constant POLYGON/ENVELOPE only");
+      auto stream = cudf::get_default_stream(cudf::allow_default_stream);
+      auto mr = get_temp_mr();
+      auto poly =
+          std::make_shared<GpuPolygon>(xy.size(), partEnds.size(), stream, mr);
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          poly->xy.data(),
+          xy.data(),
+          xy.size() * sizeof(double),
+          cudaMemcpyHostToDevice,
+          stream.value()));
+      CUDF_CUDA_TRY(cudaMemcpyAsync(
+          poly->partEnds.data(),
+          partEnds.data(),
+          partEnds.size() * sizeof(int32_t),
+          cudaMemcpyHostToDevice,
+          stream.value()));
+      stream.synchronize();
+      constPolygon_ = std::move(poly);
+      polygonOnLeft_ = polygonOnLeft;
+      VELOX_CHECK(
+          !polygonOnLeft_,
+          "ST_Distance GPU expects POINT column vs constant POLYGON (Q3 order)");
+      return;
+    }
+
+    VELOX_CHECK_EQ(
+        tag,
+        kPointTag,
+        "ST_Distance GPU constant must be POINT, POLYGON, or ENVELOPE");
+    if (polygonOnLeft) {
+      leftScalar_ = makeScalarFromConstantExpr(constantExpr, pool);
+    } else {
+      rightScalar_ = makeScalarFromConstantExpr(constantExpr, pool);
+    }
+  }
+
   std::unique_ptr<cudf::scalar> leftScalar_;
   std::unique_ptr<cudf::scalar> rightScalar_;
+  std::shared_ptr<GpuPolygon> constPolygon_;
+  bool polygonOnLeft_{false};
 };
 
 } // namespace

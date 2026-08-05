@@ -21,7 +21,10 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/resource_ref.hpp>
 
+#include <cstdint>
 #include <memory>
+#include <string_view>
+#include <vector>
 
 namespace facebook::velox::cudf_velox {
 
@@ -58,6 +61,31 @@ std::unique_ptr<cudf::column> makePointGeometry(
 /// Non-POINT / unsupported WKB sets *invalidTypeFlag and nulls the row.
 std::unique_ptr<cudf::column> wkbPointToVeloxGeometry(
     cudf::column_view const& wkb,
+    int32_t* invalidTypeFlag,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
+/// Device view of a constant polygon (shell = part 0, holes = rest).
+struct DevicePolygonView {
+  double const* xy{nullptr}; // interleaved x,y ; length 2 * numPoints
+  int32_t const* partEnds{nullptr}; // exclusive end point index per part
+  int32_t numParts{0};
+  int32_t numPoints{0};
+};
+
+/// Host-side parse of a Velox POLYGON or ENVELOPE blob into ring coordinates.
+/// Returns false if the type is unsupported (non-polygon / empty).
+bool parseVeloxPolygon(
+    std::string_view geometry,
+    std::vector<double>& xyOut,
+    std::vector<int32_t>& partEndsOut);
+
+/// Euclidean distance from Velox POINT column to a constant polygon.
+/// Points inside the shell and outside all holes yield 0. Non-POINT inputs
+/// set *invalidTypeFlag.
+std::unique_ptr<cudf::column> pointToConstantPolygonDistance(
+    cudf::column_view const& points,
+    DevicePolygonView polygon,
     int32_t* invalidTypeFlag,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);

@@ -57,9 +57,9 @@ std::unique_ptr<cudf::column> makePointGeometry(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);
 
-/// Convert WKB POINT (2D, with optional EWKB SRID) to Velox POINT blobs.
-/// Non-POINT / unsupported WKB sets *invalidTypeFlag and nulls the row.
-std::unique_ptr<cudf::column> wkbPointToVeloxGeometry(
+/// Convert WKB POINT/POLYGON (2D, optional EWKB SRID) to Velox geometry blobs.
+/// Unsupported / malformed WKB sets *invalidTypeFlag and nulls the row.
+std::unique_ptr<cudf::column> wkbToVeloxGeometry(
     cudf::column_view const& wkb,
     int32_t* invalidTypeFlag,
     rmm::cuda_stream_view stream,
@@ -86,6 +86,15 @@ bool parseVeloxPolygon(
 std::unique_ptr<cudf::column> pointToConstantPolygonDistance(
     cudf::column_view const& points,
     DevicePolygonView polygon,
+    int32_t* invalidTypeFlag,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
+/// Euclidean ST_Distance for two geometry columns. Supports POINT–POINT and
+/// POINT–POLYGON (either side). Degrees; matches CPU SpatialBench semantics.
+std::unique_ptr<cudf::column> geometryDistance(
+    cudf::column_view const& left,
+    cudf::column_view const& right,
     int32_t* invalidTypeFlag,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);

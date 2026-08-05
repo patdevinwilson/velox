@@ -28,6 +28,7 @@
 
 #include <thrust/for_each.h>
 #include <thrust/iterator/counting_iterator.h>
+#include <thrust/scan.h>
 
 #include <cmath>
 #include <cstdint>
@@ -41,9 +42,14 @@
 namespace facebook::velox::cudf_velox {
 namespace {
 
-// Must match GeometrySerializationType::POINT in GeometryConstants.h.
+// Must match GeometrySerializationType in GeometryConstants.h.
 constexpr uint8_t kPointTag = 0;
+constexpr uint8_t kPolygonTag = 4;
+constexpr uint8_t kEnvelopeTag = 7;
 constexpr int32_t kPointBlobSize = 17; // 1 + 8 + 8
+constexpr int32_t kEsriPolygon = 5;
+constexpr int32_t kEmptyPolygonBlobSize = 45; // tag+esri+envelope+numParts+numPoints
+constexpr uint32_t kWkbSridFlag = 0x20000000u;
 
 __device__ inline void markInvalid(int32_t* flag) {
   if (flag != nullptr) {
@@ -125,55 +131,6 @@ __device__ inline double readF64(char const* p, bool littleEndian) {
   return out;
 }
 
-/// Parse 2D WKB/EWKB Point into Velox POINT blob bytes at out[17].
-/// Returns false on unsupported / truncated input.
-__device__ inline bool wkbPointToVeloxBlob(
-    char const* wkb,
-    cudf::size_type len,
-    char* out,
-    int32_t* invalidTypeFlag) {
-  // Minimal 2D Point WKB: endian(1) + type(4) + x(8) + y(8) = 21.
-  if (len < 21) {
-    markInvalid(invalidTypeFlag);
-    return false;
-  }
-  uint8_t const byteOrder = static_cast<uint8_t>(wkb[0]);
-  if (byteOrder > 1) {
-    markInvalid(invalidTypeFlag);
-    return false;
-  }
-  bool const le = byteOrder == 1;
-  uint32_t typeWord = readU32(wkb + 1, le);
-  // Strip EWKB high flags; keep ISO type in low 8 bits for Point==1.
-  constexpr uint32_t kSridFlag = 0x20000000u;
-  bool const hasSrid = (typeWord & kSridFlag) != 0;
-  uint32_t const geomType = typeWord & 0xFFu;
-  if (geomType != 1) {
-    // Only 2D Point (type 1). PointZ/M etc. rejected for Phase 1.
-    markInvalid(invalidTypeFlag);
-    return false;
-  }
-  cudf::size_type coordOffset = 5;
-  if (hasSrid) {
-    if (len < 25) {
-      markInvalid(invalidTypeFlag);
-      return false;
-    }
-    coordOffset = 9;
-  }
-  double const x = readF64(wkb + coordOffset, le);
-  double const y = readF64(wkb + coordOffset + 8, le);
-  out[0] = static_cast<char>(kPointTag);
-  auto const* xb = reinterpret_cast<char const*>(&x);
-  auto const* yb = reinterpret_cast<char const*>(&y);
-#pragma unroll
-  for (int b = 0; b < 8; ++b) {
-    out[1 + b] = xb[b];
-    out[9 + b] = yb[b];
-  }
-  return true;
-}
-
 __device__ inline double distPointSegment(
     double px,
     double py,
@@ -253,6 +210,432 @@ __device__ inline double minDistToRing(
       xy[2 * partStart],
       xy[2 * partStart + 1]);
   return fmin(best, dClose);
+}
+
+__device__ inline int32_t readI32Native(char const* p) {
+  int32_t v = 0;
+  auto* outb = reinterpret_cast<char*>(&v);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    outb[i] = p[i];
+  }
+  return v;
+}
+
+__device__ inline double readF64Native(char const* p) {
+  double v = 0;
+  auto* outb = reinterpret_cast<char*>(&v);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    outb[i] = p[i];
+  }
+  return v;
+}
+
+__device__ inline void writeI32Native(char* p, int32_t v) {
+  auto const* b = reinterpret_cast<char const*>(&v);
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    p[i] = b[i];
+  }
+}
+
+__device__ inline void writeF64Native(char* p, double v) {
+  auto const* b = reinterpret_cast<char const*>(&v);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    p[i] = b[i];
+  }
+}
+
+__device__ inline double xyBytesX(char const* xy, int32_t i) {
+  return readF64Native(xy + static_cast<std::size_t>(i) * 16);
+}
+
+__device__ inline double xyBytesY(char const* xy, int32_t i) {
+  return readF64Native(xy + static_cast<std::size_t>(i) * 16 + 8);
+}
+
+__device__ inline bool pointInRingBytes(
+    double px,
+    double py,
+    char const* xy,
+    int32_t partStart,
+    int32_t partEnd) {
+  if (partEnd - partStart < 3) {
+    return false;
+  }
+  bool inside = false;
+  for (int32_t i = partStart, j = partEnd - 1; i < partEnd; j = i++) {
+    double const xi = xyBytesX(xy, i);
+    double const yi = xyBytesY(xy, i);
+    double const xj = xyBytesX(xy, j);
+    double const yj = xyBytesY(xy, j);
+    bool const intersect = ((yi > py) != (yj > py)) &&
+        (px < (xj - xi) * (py - yi) / (yj - yi + 0.0) + xi);
+    if (intersect) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+__device__ inline double minDistToRingBytes(
+    double px,
+    double py,
+    char const* xy,
+    int32_t partStart,
+    int32_t partEnd) {
+  double best = INFINITY;
+  if (partEnd - partStart < 2) {
+    return best;
+  }
+  for (int32_t i = partStart; i < partEnd - 1; ++i) {
+    double const d = distPointSegment(
+        px,
+        py,
+        xyBytesX(xy, i),
+        xyBytesY(xy, i),
+        xyBytesX(xy, i + 1),
+        xyBytesY(xy, i + 1));
+    best = fmin(best, d);
+  }
+  int32_t const last = partEnd - 1;
+  double const dClose = distPointSegment(
+      px,
+      py,
+      xyBytesX(xy, last),
+      xyBytesY(xy, last),
+      xyBytesX(xy, partStart),
+      xyBytesY(xy, partStart));
+  return fmin(best, dClose);
+}
+
+/// Distance from point to Velox POLYGON/ENVELOPE blob (unaligned-safe).
+__device__ inline bool distPointToPolygonBlob(
+    double px,
+    double py,
+    char const* data,
+    cudf::size_type len,
+    double& outDist,
+    int32_t* invalidTypeFlag) {
+  if (len < 1) {
+    markInvalid(invalidTypeFlag);
+    return false;
+  }
+  uint8_t const tag = static_cast<uint8_t>(data[0]);
+
+  char envXy[80]; // 5 points * 16
+  char const* xy = nullptr;
+  int32_t numParts = 0;
+  int32_t numPoints = 0;
+  bool envelope = false;
+
+  if (tag == kEnvelopeTag) {
+    if (len < 1 + 32) {
+      markInvalid(invalidTypeFlag);
+      return false;
+    }
+    double const xmin = readF64Native(data + 1);
+    double const ymin = readF64Native(data + 9);
+    double const xmax = readF64Native(data + 17);
+    double const ymax = readF64Native(data + 25);
+    double coords[10] = {
+        xmin,
+        ymin,
+        xmax,
+        ymin,
+        xmax,
+        ymax,
+        xmin,
+        ymax,
+        xmin,
+        ymin};
+#pragma unroll
+    for (int i = 0; i < 10; ++i) {
+      writeF64Native(envXy + i * 8, coords[i]);
+    }
+    xy = envXy;
+    numParts = 1;
+    numPoints = 5;
+    envelope = true;
+  } else if (tag == kPolygonTag) {
+    if (len < kEmptyPolygonBlobSize) {
+      markInvalid(invalidTypeFlag);
+      return false;
+    }
+    numParts = readI32Native(data + 37);
+    numPoints = readI32Native(data + 41);
+    if (numParts <= 0 || numPoints <= 0) {
+      return false; // empty → null
+    }
+    std::size_t const partsBytes =
+        static_cast<std::size_t>(numParts) * sizeof(int32_t);
+    std::size_t const xyBytesNeeded =
+        static_cast<std::size_t>(numPoints) * 16;
+    if (static_cast<std::size_t>(len) <
+        static_cast<std::size_t>(kEmptyPolygonBlobSize) + partsBytes +
+            xyBytesNeeded) {
+      markInvalid(invalidTypeFlag);
+      return false;
+    }
+    xy = data + kEmptyPolygonBlobSize +
+        static_cast<std::size_t>(numParts) * 4;
+  } else {
+    markInvalid(invalidTypeFlag);
+    return false;
+  }
+
+  // Compute part starts/ends without lambdas (device-friendly).
+  int32_t shellStart = 0;
+  int32_t shellEnd = numPoints;
+  if (!envelope) {
+    shellStart = readI32Native(data + kEmptyPolygonBlobSize);
+    shellEnd = (numParts > 1)
+        ? readI32Native(data + kEmptyPolygonBlobSize + 4)
+        : numPoints;
+  }
+
+  bool const inShell =
+      pointInRingBytes(px, py, xy, shellStart, shellEnd);
+  bool inHole = false;
+  if (inShell && !envelope) {
+    for (int32_t p = 1; p < numParts; ++p) {
+      int32_t const hs = readI32Native(
+          data + kEmptyPolygonBlobSize + static_cast<std::size_t>(p) * 4);
+      int32_t const he = (p + 1 < numParts)
+          ? readI32Native(
+                data + kEmptyPolygonBlobSize +
+                static_cast<std::size_t>(p + 1) * 4)
+          : numPoints;
+      if (pointInRingBytes(px, py, xy, hs, he)) {
+        inHole = true;
+        break;
+      }
+    }
+  }
+  if (inShell && !inHole) {
+    outDist = 0.0;
+    return true;
+  }
+
+  double best = INFINITY;
+  for (int32_t p = 0; p < numParts; ++p) {
+    int32_t ps = 0;
+    int32_t pe = numPoints;
+    if (!envelope) {
+      ps = readI32Native(
+          data + kEmptyPolygonBlobSize + static_cast<std::size_t>(p) * 4);
+      pe = (p + 1 < numParts)
+          ? readI32Native(
+                data + kEmptyPolygonBlobSize +
+                static_cast<std::size_t>(p + 1) * 4)
+          : numPoints;
+    }
+    best = fmin(best, minDistToRingBytes(px, py, xy, ps, pe));
+  }
+  outDist = best;
+  return true;
+}
+
+__device__ inline int32_t veloxPolygonBlobSize(int32_t numParts, int32_t numPoints) {
+  return kEmptyPolygonBlobSize + 4 * numParts + 16 * numPoints;
+}
+
+/// Inspect WKB and return Velox blob byte size. Returns false → null row.
+__device__ inline bool wkbVeloxOutputSize(
+    char const* wkb,
+    cudf::size_type len,
+    int32_t* outSize,
+    int32_t* invalidTypeFlag) {
+  if (len < 5) {
+    markInvalid(invalidTypeFlag);
+    return false;
+  }
+  uint8_t const byteOrder = static_cast<uint8_t>(wkb[0]);
+  if (byteOrder > 1) {
+    markInvalid(invalidTypeFlag);
+    return false;
+  }
+  bool const le = byteOrder == 1;
+  uint32_t typeWord = readU32(wkb + 1, le);
+  bool const hasSrid = (typeWord & kWkbSridFlag) != 0;
+  uint32_t const geomType = typeWord & 0xFFu;
+  cudf::size_type body = 5;
+  if (hasSrid) {
+    if (len < 9) {
+      markInvalid(invalidTypeFlag);
+      return false;
+    }
+    body = 9;
+  }
+
+  if (geomType == 1) {
+    if (len < body + 16) {
+      markInvalid(invalidTypeFlag);
+      return false;
+    }
+    *outSize = kPointBlobSize;
+    return true;
+  }
+  if (geomType != 3) {
+    markInvalid(invalidTypeFlag);
+    return false;
+  }
+  // Polygon: numRings + rings.
+  if (len < body + 4) {
+    markInvalid(invalidTypeFlag);
+    return false;
+  }
+  uint32_t const numRings = readU32(wkb + body, le);
+  if (numRings > 100000u) {
+    markInvalid(invalidTypeFlag);
+    return false;
+  }
+  cudf::size_type off = body + 4;
+  int32_t numPoints = 0;
+  for (uint32_t r = 0; r < numRings; ++r) {
+    if (off + 4 > len) {
+      markInvalid(invalidTypeFlag);
+      return false;
+    }
+    uint32_t const n = readU32(wkb + off, le);
+    off += 4;
+    if (n > 10000000u ||
+        off + static_cast<cudf::size_type>(n) * 16 > len) {
+      markInvalid(invalidTypeFlag);
+      return false;
+    }
+    off += static_cast<cudf::size_type>(n) * 16;
+    numPoints += static_cast<int32_t>(n);
+  }
+  int32_t const numParts = static_cast<int32_t>(numRings);
+  *outSize = (numParts == 0) ? kEmptyPolygonBlobSize
+                             : veloxPolygonBlobSize(numParts, numPoints);
+  return true;
+}
+
+__device__ inline bool wkbToVeloxBlob(
+    char const* wkb,
+    cudf::size_type len,
+    char* out,
+    int32_t outSize,
+    int32_t* invalidTypeFlag) {
+  if (len < 5) {
+    markInvalid(invalidTypeFlag);
+    return false;
+  }
+  uint8_t const byteOrder = static_cast<uint8_t>(wkb[0]);
+  if (byteOrder > 1) {
+    markInvalid(invalidTypeFlag);
+    return false;
+  }
+  bool const le = byteOrder == 1;
+  uint32_t typeWord = readU32(wkb + 1, le);
+  bool const hasSrid = (typeWord & kWkbSridFlag) != 0;
+  uint32_t const geomType = typeWord & 0xFFu;
+  cudf::size_type body = 5;
+  if (hasSrid) {
+    if (len < 9) {
+      markInvalid(invalidTypeFlag);
+      return false;
+    }
+    body = 9;
+  }
+
+  if (geomType == 1) {
+    if (outSize < kPointBlobSize || len < body + 16) {
+      markInvalid(invalidTypeFlag);
+      return false;
+    }
+    double const x = readF64(wkb + body, le);
+    double const y = readF64(wkb + body + 8, le);
+    out[0] = static_cast<char>(kPointTag);
+    writeF64Native(out + 1, x);
+    writeF64Native(out + 9, y);
+    return true;
+  }
+  if (geomType != 3) {
+    markInvalid(invalidTypeFlag);
+    return false;
+  }
+  if (len < body + 4) {
+    markInvalid(invalidTypeFlag);
+    return false;
+  }
+  uint32_t const numRings = readU32(wkb + body, le);
+  int32_t const numParts = static_cast<int32_t>(numRings);
+  if (numParts == 0) {
+    if (outSize < kEmptyPolygonBlobSize) {
+      markInvalid(invalidTypeFlag);
+      return false;
+    }
+    out[0] = static_cast<char>(kPolygonTag);
+    writeI32Native(out + 1, kEsriPolygon);
+    double const nan = NAN;
+    writeF64Native(out + 5, nan);
+    writeF64Native(out + 13, nan);
+    writeF64Native(out + 21, nan);
+    writeF64Native(out + 29, nan);
+    writeI32Native(out + 37, 0);
+    writeI32Native(out + 41, 0);
+    return true;
+  }
+
+  // Count points (already validated in size pass, re-check bounds).
+  cudf::size_type off = body + 4;
+  int32_t numPoints = 0;
+  for (int32_t r = 0; r < numParts; ++r) {
+    if (off + 4 > len) {
+      markInvalid(invalidTypeFlag);
+      return false;
+    }
+    uint32_t const n = readU32(wkb + off, le);
+    off += 4 + static_cast<cudf::size_type>(n) * 16;
+    numPoints += static_cast<int32_t>(n);
+  }
+  int32_t const need = veloxPolygonBlobSize(numParts, numPoints);
+  if (outSize < need) {
+    markInvalid(invalidTypeFlag);
+    return false;
+  }
+
+  out[0] = static_cast<char>(kPolygonTag);
+  writeI32Native(out + 1, kEsriPolygon);
+  writeI32Native(out + 37, numParts);
+  writeI32Native(out + 41, numPoints);
+
+  char* partPtr = out + kEmptyPolygonBlobSize;
+  char* xyPtr = partPtr + 4 * numParts;
+  double xmin = INFINITY;
+  double ymin = INFINITY;
+  double xmax = -INFINITY;
+  double ymax = -INFINITY;
+
+  off = body + 4;
+  int32_t pointIdx = 0;
+  for (int32_t r = 0; r < numParts; ++r) {
+    writeI32Native(partPtr + 4 * r, pointIdx);
+    uint32_t const n = readU32(wkb + off, le);
+    off += 4;
+    for (uint32_t i = 0; i < n; ++i) {
+      double const x = readF64(wkb + off, le);
+      double const y = readF64(wkb + off + 8, le);
+      off += 16;
+      xmin = fmin(xmin, x);
+      ymin = fmin(ymin, y);
+      xmax = fmax(xmax, x);
+      ymax = fmax(ymax, y);
+      writeF64Native(xyPtr + static_cast<std::size_t>(pointIdx) * 16, x);
+      writeF64Native(xyPtr + static_cast<std::size_t>(pointIdx) * 16 + 8, y);
+      ++pointIdx;
+    }
+  }
+  writeF64Native(out + 5, xmin);
+  writeF64Native(out + 13, ymin);
+  writeF64Native(out + 21, xmax);
+  writeF64Native(out + 29, ymax);
+  return true;
 }
 
 } // namespace
@@ -474,7 +857,7 @@ std::unique_ptr<cudf::column> makePointGeometry(
       std::move(nullMask));
 }
 
-std::unique_ptr<cudf::column> wkbPointToVeloxGeometry(
+std::unique_ptr<cudf::column> wkbToVeloxGeometry(
     cudf::column_view const& wkb,
     int32_t* invalidTypeFlag,
     rmm::cuda_stream_view stream,
@@ -485,25 +868,6 @@ std::unique_ptr<cudf::column> wkbPointToVeloxGeometry(
 
   cudf::strings_column_view strings(wkb);
   auto const size = wkb.size();
-
-  auto offsetsCol = cudf::make_numeric_column(
-      cudf::data_type{cudf::type_id::INT32},
-      size + 1,
-      cudf::mask_state::UNALLOCATED,
-      stream,
-      mr);
-  auto* offsets = offsetsCol->mutable_view().data<cudf::size_type>();
-  thrust::for_each_n(
-      rmm::exec_policy(stream),
-      thrust::counting_iterator<cudf::size_type>(0),
-      size + 1,
-      [offsets] __device__(cudf::size_type i) {
-        offsets[i] = i * kPointBlobSize;
-      });
-
-  rmm::device_uvector<char> chars(
-      static_cast<std::size_t>(size) * kPointBlobSize, stream, mr);
-  auto* charsPtr = chars.data();
 
   auto inChars = strings.chars_begin(stream);
   auto inOffsets = strings.offsets().begin<cudf::size_type>();
@@ -520,11 +884,74 @@ std::unique_ptr<cudf::column> wkbPointToVeloxGeometry(
   }();
   auto* outMask = static_cast<cudf::bitmask_type*>(nullMaskBuf.data());
 
+  // sizes[0..size-1] = blob bytes; sizes[size]=0 for exclusive_scan → offsets.
+  rmm::device_uvector<cudf::size_type> sizes(size + 1, stream, mr);
+  auto* sizesPtr = sizes.data();
+  thrust::for_each_n(
+      rmm::exec_policy(stream),
+      thrust::counting_iterator<cudf::size_type>(0),
+      size + 1,
+      [sizesPtr,
+       inChars,
+       inOffsets,
+       inNull,
+       outMask,
+       invalidTypeFlag,
+       size,
+       inNullCount = wkb.null_count()] __device__(cudf::size_type i) {
+        if (i == size) {
+          sizesPtr[i] = 0;
+          return;
+        }
+        if (inNullCount > 0 && inNull != nullptr &&
+            !cudf::bit_is_set(inNull, i)) {
+          sizesPtr[i] = 0;
+          return;
+        }
+        int32_t blobSize = 0;
+        auto const start = inOffsets[i];
+        auto const end = inOffsets[i + 1];
+        if (!wkbVeloxOutputSize(
+                inChars + start, end - start, &blobSize, invalidTypeFlag)) {
+          sizesPtr[i] = 0;
+          cudf::clear_bit_unsafe(outMask, i);
+          return;
+        }
+        sizesPtr[i] = static_cast<cudf::size_type>(blobSize);
+      });
+
+  auto offsetsCol = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT32},
+      size + 1,
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      mr);
+  auto* offsets = offsetsCol->mutable_view().data<cudf::size_type>();
+  thrust::exclusive_scan(
+      rmm::exec_policy(stream),
+      sizes.begin(),
+      sizes.end(),
+      offsets);
+
+  cudf::size_type totalChars = 0;
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      &totalChars,
+      offsets + size,
+      sizeof(cudf::size_type),
+      cudaMemcpyDeviceToHost,
+      stream.value()));
+  stream.synchronize();
+
+  rmm::device_uvector<char> chars(
+      static_cast<std::size_t>(totalChars), stream, mr);
+  auto* charsPtr = chars.data();
+
   thrust::for_each_n(
       rmm::exec_policy(stream),
       thrust::counting_iterator<cudf::size_type>(0),
       size,
       [charsPtr,
+       offsets,
        inChars,
        inOffsets,
        inNull,
@@ -535,17 +962,33 @@ std::unique_ptr<cudf::column> wkbPointToVeloxGeometry(
             !cudf::bit_is_set(inNull, i)) {
           return;
         }
+        if (!cudf::bit_is_set(outMask, i)) {
+          return;
+        }
+        auto const outStart = offsets[i];
+        auto const outEnd = offsets[i + 1];
+        auto const outLen = outEnd - outStart;
+        if (outLen <= 0) {
+          cudf::clear_bit_unsafe(outMask, i);
+          return;
+        }
         auto const start = inOffsets[i];
         auto const end = inOffsets[i + 1];
-        char* row = charsPtr + static_cast<std::size_t>(i) * kPointBlobSize;
-        if (!wkbPointToVeloxBlob(
-                inChars + start, end - start, row, invalidTypeFlag)) {
+        if (!wkbToVeloxBlob(
+                inChars + start,
+                end - start,
+                charsPtr + outStart,
+                outLen,
+                invalidTypeFlag)) {
           cudf::clear_bit_unsafe(outMask, i);
         }
       });
 
-  auto nullCount =
-      cudf::null_count(static_cast<cudf::bitmask_type const*>(nullMaskBuf.data()), 0, size, stream);
+  auto nullCount = cudf::null_count(
+      static_cast<cudf::bitmask_type const*>(nullMaskBuf.data()),
+      0,
+      size,
+      stream);
   return cudf::make_strings_column(
       size,
       std::move(offsetsCol),
@@ -725,6 +1168,142 @@ std::unique_ptr<cudf::column> pointToConstantPolygonDistance(
           best = fmin(best, minDistToRing(px, py, xy, ps, pe));
         }
         outPtr[i] = best;
+      });
+
+  out->set_null_count(
+      cudf::null_count(out->view().null_mask(), 0, size, stream));
+  return out;
+}
+
+std::unique_ptr<cudf::column> geometryDistance(
+    cudf::column_view const& left,
+    cudf::column_view const& right,
+    int32_t* invalidTypeFlag,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  CUDF_EXPECTS(
+      left.type().id() == cudf::type_id::STRING &&
+          right.type().id() == cudf::type_id::STRING,
+      "geometry inputs must be STRING/VARBINARY");
+  CUDF_EXPECTS(left.size() == right.size(), "geometry size mismatch");
+
+  cudf::strings_column_view leftStr(left);
+  cudf::strings_column_view rightStr(right);
+  auto const size = left.size();
+  auto out = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::FLOAT64},
+      size,
+      cudf::mask_state::ALL_VALID,
+      stream,
+      mr);
+  auto* outPtr = out->mutable_view().data<double>();
+  auto outMask =
+      static_cast<cudf::bitmask_type*>(out->mutable_view().null_mask());
+
+  auto leftChars = leftStr.chars_begin(stream);
+  auto rightChars = rightStr.chars_begin(stream);
+  auto leftOffsets = leftStr.offsets().begin<cudf::size_type>();
+  auto rightOffsets = rightStr.offsets().begin<cudf::size_type>();
+  auto leftNull = left.null_mask();
+  auto rightNull = right.null_mask();
+
+  thrust::for_each_n(
+      rmm::exec_policy(stream),
+      thrust::counting_iterator<cudf::size_type>(0),
+      size,
+      [leftChars,
+       rightChars,
+       leftOffsets,
+       rightOffsets,
+       leftNull,
+       rightNull,
+       outPtr,
+       outMask,
+       invalidTypeFlag,
+       leftNullCount = left.null_count(),
+       rightNullCount = right.null_count()] __device__(cudf::size_type i) {
+        if ((leftNullCount > 0 && leftNull != nullptr &&
+             !cudf::bit_is_set(leftNull, i)) ||
+            (rightNullCount > 0 && rightNull != nullptr &&
+             !cudf::bit_is_set(rightNull, i))) {
+          cudf::clear_bit_unsafe(outMask, i);
+          return;
+        }
+        auto const ls = leftOffsets[i];
+        auto const le = leftOffsets[i + 1];
+        auto const rs = rightOffsets[i];
+        auto const re = rightOffsets[i + 1];
+        char const* leftData = leftChars + ls;
+        char const* rightData = rightChars + rs;
+        auto const leftLen = le - ls;
+        auto const rightLen = re - rs;
+        if (leftLen < 1 || rightLen < 1) {
+          markInvalid(invalidTypeFlag);
+          cudf::clear_bit_unsafe(outMask, i);
+          return;
+        }
+        uint8_t const leftTag = static_cast<uint8_t>(leftData[0]);
+        uint8_t const rightTag = static_cast<uint8_t>(rightData[0]);
+
+        // POINT–POINT
+        if (leftTag == kPointTag && rightTag == kPointTag) {
+          double x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+          if (!readPointXY(leftData, leftLen, x1, y1, invalidTypeFlag) ||
+              !readPointXY(rightData, rightLen, x2, y2, invalidTypeFlag)) {
+            cudf::clear_bit_unsafe(outMask, i);
+            return;
+          }
+          if (isEmptyPoint(x1, y1) || isEmptyPoint(x2, y2)) {
+            cudf::clear_bit_unsafe(outMask, i);
+            return;
+          }
+          double const dx = x1 - x2;
+          double const dy = y1 - y2;
+          outPtr[i] = sqrt(dx * dx + dy * dy);
+          return;
+        }
+
+        // POINT–POLYGON / ENVELOPE (either order)
+        bool leftIsPoint = leftTag == kPointTag;
+        bool rightIsPoly =
+            rightTag == kPolygonTag || rightTag == kEnvelopeTag;
+        bool rightIsPoint = rightTag == kPointTag;
+        bool leftIsPoly = leftTag == kPolygonTag || leftTag == kEnvelopeTag;
+
+        double px = 0;
+        double py = 0;
+        char const* polyData = nullptr;
+        cudf::size_type polyLen = 0;
+        if (leftIsPoint && rightIsPoly) {
+          if (!readPointXY(leftData, leftLen, px, py, invalidTypeFlag)) {
+            cudf::clear_bit_unsafe(outMask, i);
+            return;
+          }
+          polyData = rightData;
+          polyLen = rightLen;
+        } else if (leftIsPoly && rightIsPoint) {
+          if (!readPointXY(rightData, rightLen, px, py, invalidTypeFlag)) {
+            cudf::clear_bit_unsafe(outMask, i);
+            return;
+          }
+          polyData = leftData;
+          polyLen = leftLen;
+        } else {
+          markInvalid(invalidTypeFlag);
+          cudf::clear_bit_unsafe(outMask, i);
+          return;
+        }
+        if (isEmptyPoint(px, py)) {
+          cudf::clear_bit_unsafe(outMask, i);
+          return;
+        }
+        double dist = 0;
+        if (!distPointToPolygonBlob(
+                px, py, polyData, polyLen, dist, invalidTypeFlag)) {
+          cudf::clear_bit_unsafe(outMask, i);
+          return;
+        }
+        outPtr[i] = dist;
       });
 
   out->set_null_count(

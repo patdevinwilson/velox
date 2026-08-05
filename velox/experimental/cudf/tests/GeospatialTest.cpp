@@ -59,6 +59,27 @@ std::string makeWkbPoint(double x, double y) {
   return wkb;
 }
 
+/// Little-endian WKB Polygon (ISO type 3), single closed exterior ring.
+std::string makeWkbPolygon(const std::vector<std::pair<double, double>>& ring) {
+  VELOX_CHECK_GE(ring.size(), 4);
+  std::string wkb;
+  wkb.resize(1 + 4 + 4 + 4 + ring.size() * 16);
+  wkb[0] = 1; // NDR
+  uint32_t type = 3;
+  uint32_t numRings = 1;
+  uint32_t numPoints = static_cast<uint32_t>(ring.size());
+  std::memcpy(wkb.data() + 1, &type, sizeof(type));
+  std::memcpy(wkb.data() + 5, &numRings, sizeof(numRings));
+  std::memcpy(wkb.data() + 9, &numPoints, sizeof(numPoints));
+  for (size_t i = 0; i < ring.size(); ++i) {
+    std::memcpy(
+        wkb.data() + 13 + i * 16, &ring[i].first, sizeof(double));
+    std::memcpy(
+        wkb.data() + 13 + i * 16 + 8, &ring[i].second, sizeof(double));
+  }
+  return wkb;
+}
+
 class CudfGeospatialTest : public testing::Test,
                            public facebook::velox::test::VectorTestBase {
  protected:
@@ -284,6 +305,53 @@ TEST_F(CudfGeospatialTest, stDistancePointConstantPolygon) {
   double dEast = -111.0 - (-111.6160);
   // Inside → 0
   // South of ymin=34.7347 at x=-111.761 (inside x-range): dy=0.0347
+  double dSouth = 34.7347 - 34.7000;
+
+  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto dists = result->childAt(0)->asFlatVector<double>();
+  ASSERT_EQ(dists->size(), 3);
+  EXPECT_NEAR(dists->valueAt(0), dEast, 1e-9);
+  EXPECT_NEAR(dists->valueAt(1), 0.0, 1e-12);
+  EXPECT_NEAR(dists->valueAt(2), dSouth, 1e-9);
+}
+
+TEST_F(CudfGeospatialTest, stDistancePointPolygonColumnQ8Shape) {
+  // SpatialBench Q8 shape: ST_Distance(ST_GeomFromBinary(pickup),
+  // ST_GeomFromBinary(building_boundary)) — column POINT vs column POLYGON.
+  auto poly = makeWkbPolygon({
+      {-111.9060, 34.7347},
+      {-111.6160, 34.7347},
+      {-111.6160, 35.0047},
+      {-111.9060, 35.0047},
+      {-111.9060, 34.7347},
+  });
+  std::vector<std::string> pickups = {
+      makeWkbPoint(-111.0, 34.8), // east of box
+      makeWkbPoint(-111.76, 34.87), // inside
+      makeWkbPoint(-111.7610, 34.7000), // south of box
+  };
+  std::vector<std::string> boundaries = {poly, poly, poly};
+  std::vector<StringView> pickupViews;
+  std::vector<StringView> boundaryViews;
+  for (const auto& s : pickups) {
+    pickupViews.emplace_back(s);
+  }
+  for (const auto& s : boundaries) {
+    boundaryViews.emplace_back(s);
+  }
+  auto data = makeRowVector(
+      {"pickup", "b_boundary"},
+      {makeFlatVector<StringView>(pickupViews, VARBINARY()),
+       makeFlatVector<StringView>(boundaryViews, VARBINARY())});
+
+  auto plan =
+      PlanBuilder()
+          .values({data})
+          .project(
+              {"ST_Distance(ST_GeomFromBinary(pickup), ST_GeomFromBinary(b_boundary))"})
+          .planNode();
+
+  double dEast = -111.0 - (-111.6160);
   double dSouth = 34.7347 - 34.7000;
 
   auto result = AssertQueryBuilder(plan).copyResults(pool());

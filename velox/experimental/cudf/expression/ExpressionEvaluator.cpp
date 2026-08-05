@@ -2325,7 +2325,7 @@ class StPointFunction : public CudfFunction {
   }
 };
 
-/// Phase-1 WKB POINT → Velox POINT blob (SpatialBench trip pickup/dropoff).
+/// Phase-1 WKB POINT/POLYGON → Velox geometry blobs (SpatialBench Q1/Q8).
 class StGeomFromBinaryFunction : public CudfFunction {
  public:
   explicit StGeomFromBinaryFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
@@ -2339,15 +2339,15 @@ class StGeomFromBinaryFunction : public CudfFunction {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     rmm::device_scalar<int32_t> invalid(0, stream, mr);
-    auto out = wkbPointToVeloxGeometry(
+    auto out = wkbToVeloxGeometry(
         asView(inputColumns[0]), invalid.data(), stream, mr);
     throwIfInvalidGeometryType(invalid, stream);
     return out;
   }
 };
 
-/// Phase-1 ST_Distance: POINT–POINT, or POINT vs constant POLYGON/ENVELOPE
-/// (SpatialBench Q3). Supports a constant geometry on either side.
+/// Phase-1 ST_Distance: POINT–POINT, POINT–POLYGON column pairs, or POINT vs
+/// constant POLYGON/ENVELOPE (SpatialBench Q1/Q3/Q8).
 class StDistanceFunction : public CudfFunction {
  public:
   struct GpuPolygon {
@@ -2424,7 +2424,7 @@ class StDistanceFunction : public CudfFunction {
     }
 
     auto out =
-        pointPointDistance(leftView, rightView, invalid.data(), stream, mr);
+        geometryDistance(leftView, rightView, invalid.data(), stream, mr);
     throwIfInvalidGeometryType(invalid, stream);
     return out;
   }

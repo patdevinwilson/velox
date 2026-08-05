@@ -31,6 +31,12 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 namespace facebook::velox::cudf_velox {
 namespace {
@@ -166,6 +172,87 @@ __device__ inline bool wkbPointToVeloxBlob(
     out[9 + b] = yb[b];
   }
   return true;
+}
+
+__device__ inline double distPointSegment(
+    double px,
+    double py,
+    double ax,
+    double ay,
+    double bx,
+    double by) {
+  double const dx = bx - ax;
+  double const dy = by - ay;
+  double const len2 = dx * dx + dy * dy;
+  if (len2 == 0.0) {
+    double const ex = px - ax;
+    double const ey = py - ay;
+    return sqrt(ex * ex + ey * ey);
+  }
+  double t = ((px - ax) * dx + (py - ay) * dy) / len2;
+  t = fmin(1.0, fmax(0.0, t));
+  double const qx = ax + t * dx;
+  double const qy = ay + t * dy;
+  double const ex = px - qx;
+  double const ey = py - qy;
+  return sqrt(ex * ex + ey * ey);
+}
+
+/// Even-odd point-in-ring. partStart/partEnd are point indices [start, end).
+__device__ inline bool pointInRing(
+    double px,
+    double py,
+    double const* xy,
+    int32_t partStart,
+    int32_t partEnd) {
+  if (partEnd - partStart < 3) {
+    return false;
+  }
+  bool inside = false;
+  for (int32_t i = partStart, j = partEnd - 1; i < partEnd; j = i++) {
+    double const xi = xy[2 * i];
+    double const yi = xy[2 * i + 1];
+    double const xj = xy[2 * j];
+    double const yj = xy[2 * j + 1];
+    bool const intersect = ((yi > py) != (yj > py)) &&
+        (px < (xj - xi) * (py - yi) / (yj - yi + 0.0) + xi);
+    if (intersect) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+__device__ inline double minDistToRing(
+    double px,
+    double py,
+    double const* xy,
+    int32_t partStart,
+    int32_t partEnd) {
+  double best = INFINITY;
+  if (partEnd - partStart < 2) {
+    return best;
+  }
+  for (int32_t i = partStart; i < partEnd - 1; ++i) {
+    double const d = distPointSegment(
+        px,
+        py,
+        xy[2 * i],
+        xy[2 * i + 1],
+        xy[2 * (i + 1)],
+        xy[2 * (i + 1) + 1]);
+    best = fmin(best, d);
+  }
+  // Close the ring if first != last (still safe if already closed).
+  int32_t const last = partEnd - 1;
+  double const dClose = distPointSegment(
+      px,
+      py,
+      xy[2 * last],
+      xy[2 * last + 1],
+      xy[2 * partStart],
+      xy[2 * partStart + 1]);
+  return fmin(best, dClose);
 }
 
 } // namespace
@@ -465,6 +552,184 @@ std::unique_ptr<cudf::column> wkbPointToVeloxGeometry(
       chars.release(),
       nullCount,
       std::move(nullMaskBuf));
+}
+
+namespace {
+
+template <typename T>
+T readPod(char const*& p, char const* end) {
+  if (p + sizeof(T) > end) {
+    throw std::runtime_error("Truncated Velox geometry blob");
+  }
+  T v;
+  std::memcpy(&v, p, sizeof(T));
+  p += sizeof(T);
+  return v;
+}
+
+} // namespace
+
+bool parseVeloxPolygon(
+    std::string_view geometry,
+    std::vector<double>& xyOut,
+    std::vector<int32_t>& partEndsOut) {
+  xyOut.clear();
+  partEndsOut.clear();
+  if (geometry.empty()) {
+    return false;
+  }
+  char const* p = geometry.data();
+  char const* end = p + geometry.size();
+  auto tag = static_cast<uint8_t>(readPod<char>(p, end));
+
+  constexpr uint8_t kPolygonTag = 4;
+  constexpr uint8_t kEnvelopeTag = 7;
+
+  if (tag == kEnvelopeTag) {
+    double xmin = readPod<double>(p, end);
+    double ymin = readPod<double>(p, end);
+    double xmax = readPod<double>(p, end);
+    double ymax = readPod<double>(p, end);
+    if (std::isnan(xmin) || std::isnan(ymin) || std::isnan(xmax) ||
+        std::isnan(ymax)) {
+      return false;
+    }
+    // Closed rectangle ring.
+    xyOut = {
+        xmin, ymin, xmax, ymin, xmax, ymax, xmin, ymax, xmin, ymin};
+    partEndsOut = {5};
+    return true;
+  }
+
+  if (tag != kPolygonTag) {
+    return false;
+  }
+  // Skip Esri type + envelope.
+  (void)readPod<int32_t>(p, end);
+  (void)readPod<double>(p, end);
+  (void)readPod<double>(p, end);
+  (void)readPod<double>(p, end);
+  (void)readPod<double>(p, end);
+
+  int32_t numParts = readPod<int32_t>(p, end);
+  int32_t numPoints = readPod<int32_t>(p, end);
+  if (numParts <= 0 || numPoints <= 0) {
+    return false;
+  }
+  std::vector<int32_t> starts(static_cast<size_t>(numParts));
+  for (int32_t i = 0; i < numParts; ++i) {
+    starts[static_cast<size_t>(i)] = readPod<int32_t>(p, end);
+  }
+  partEndsOut.resize(static_cast<size_t>(numParts));
+  for (int32_t i = 0; i < numParts - 1; ++i) {
+    partEndsOut[static_cast<size_t>(i)] = starts[static_cast<size_t>(i + 1)];
+  }
+  partEndsOut[static_cast<size_t>(numParts - 1)] = numPoints;
+
+  xyOut.resize(static_cast<size_t>(numPoints) * 2);
+  for (int32_t i = 0; i < numPoints; ++i) {
+    xyOut[static_cast<size_t>(2 * i)] = readPod<double>(p, end);
+    xyOut[static_cast<size_t>(2 * i + 1)] = readPod<double>(p, end);
+  }
+  return true;
+}
+
+std::unique_ptr<cudf::column> pointToConstantPolygonDistance(
+    cudf::column_view const& points,
+    DevicePolygonView polygon,
+    int32_t* invalidTypeFlag,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  CUDF_EXPECTS(
+      points.type().id() == cudf::type_id::STRING,
+      "points must be STRING/VARBINARY geometry");
+  CUDF_EXPECTS(polygon.numParts > 0 && polygon.numPoints > 0, "empty polygon");
+  CUDF_EXPECTS(
+      polygon.xy != nullptr && polygon.partEnds != nullptr,
+      "polygon device buffers required");
+
+  cudf::strings_column_view strings(points);
+  auto const size = points.size();
+  auto out = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::FLOAT64},
+      size,
+      cudf::mask_state::ALL_VALID,
+      stream,
+      mr);
+  auto* outPtr = out->mutable_view().data<double>();
+  auto outMask =
+      static_cast<cudf::bitmask_type*>(out->mutable_view().null_mask());
+
+  auto chars = strings.chars_begin(stream);
+  auto offsets = strings.offsets().begin<cudf::size_type>();
+  auto inNull = points.null_mask();
+  auto const* xy = polygon.xy;
+  auto const* partEnds = polygon.partEnds;
+  auto const numParts = polygon.numParts;
+
+  thrust::for_each_n(
+      rmm::exec_policy(stream),
+      thrust::counting_iterator<cudf::size_type>(0),
+      size,
+      [chars,
+       offsets,
+       inNull,
+       outPtr,
+       outMask,
+       invalidTypeFlag,
+       xy,
+       partEnds,
+       numParts,
+       nullCount = points.null_count()] __device__(cudf::size_type i) {
+        if (nullCount > 0 && inNull != nullptr &&
+            !cudf::bit_is_set(inNull, i)) {
+          cudf::clear_bit_unsafe(outMask, i);
+          return;
+        }
+        double px = 0;
+        double py = 0;
+        auto const start = offsets[i];
+        auto const end = offsets[i + 1];
+        if (!readPointXY(chars + start, end - start, px, py, invalidTypeFlag)) {
+          cudf::clear_bit_unsafe(outMask, i);
+          return;
+        }
+        if (isEmptyPoint(px, py)) {
+          cudf::clear_bit_unsafe(outMask, i);
+          return;
+        }
+
+        int32_t shellStart = 0;
+        int32_t shellEnd = partEnds[0];
+        bool const inShell = pointInRing(px, py, xy, shellStart, shellEnd);
+        bool inHole = false;
+        if (inShell) {
+          for (int32_t p = 1; p < numParts; ++p) {
+            int32_t hs = partEnds[p - 1];
+            int32_t he = partEnds[p];
+            if (pointInRing(px, py, xy, hs, he)) {
+              inHole = true;
+              break;
+            }
+          }
+        }
+        if (inShell && !inHole) {
+          outPtr[i] = 0.0;
+          return;
+        }
+
+        double best = INFINITY;
+        for (int32_t p = 0; p < numParts; ++p) {
+          int32_t ps = (p == 0) ? 0 : partEnds[p - 1];
+          int32_t pe = partEnds[p];
+          best = fmin(best, minDistToRing(px, py, xy, ps, pe));
+        }
+        outPtr[i] = best;
+      });
+
+  out->set_null_count(
+      cudf::null_count(out->view().null_mask(), 0, size, stream));
+  return out;
 }
 
 } // namespace facebook::velox::cudf_velox

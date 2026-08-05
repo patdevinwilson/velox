@@ -42,11 +42,15 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/datetime.hpp>
+#include <cudf/filling.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/hashing.hpp>
 #include <cudf/lists/count_elements.hpp>
+#include <cudf/lists/lists_column_view.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/reduction.hpp>
 #include <cudf/replace.hpp>
+#include <cudf/reshape.hpp>
 #include <cudf/round.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
@@ -2172,7 +2176,7 @@ void throwIfInvalidGeometryType(
     rmm::device_scalar<int32_t>& flag,
     rmm::cuda_stream_view stream) {
   if (flag.value(stream) != 0) {
-    VELOX_USER_FAIL("ST_* requires a Point geometry");
+    VELOX_USER_FAIL("Invalid geometry input to ST_*");
   }
 }
 
@@ -2390,6 +2394,88 @@ class StDistanceFunction : public CudfFunction {
   std::unique_ptr<cudf::scalar> rightScalar_;
   std::shared_ptr<GpuPolygon> constPolygon_;
   bool polygonOnLeft_{false};
+};
+
+/// Build array(T) from N columns of T via interleave + fixed-size lists.
+/// Required for SpatialBench Q7: ST_LineString(ARRAY[...]).
+class ArrayConstructorFunction : public CudfFunction {
+ public:
+  explicit ArrayConstructorFunction(const core::TypedExprPtr& expr) {
+    VELOX_CHECK(
+        !expr->inputs().empty(),
+        "GPU array_constructor requires at least one argument");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK(!inputColumns.empty());
+    auto const numElements = static_cast<cudf::size_type>(inputColumns.size());
+    auto const numRows = asView(inputColumns[0]).size();
+
+    std::vector<cudf::column_view> views;
+    views.reserve(inputColumns.size());
+    for (auto& col : inputColumns) {
+      auto view = asView(col);
+      VELOX_CHECK_EQ(view.size(), numRows, "array_constructor size mismatch");
+      views.push_back(view);
+    }
+
+    auto interleaved =
+        cudf::interleave_columns(cudf::table_view{views}, stream, mr);
+
+    cudf::numeric_scalar<int32_t> init(0, true, stream, mr);
+    cudf::numeric_scalar<int32_t> step(numElements, true, stream, mr);
+    auto offsetsCol = cudf::sequence(numRows + 1, init, step, stream, mr);
+
+    auto nullMask =
+        cudf::create_null_mask(numRows, cudf::mask_state::ALL_VALID, stream, mr);
+    return cudf::make_lists_column(
+        numRows,
+        std::move(offsetsCol),
+        std::move(interleaved),
+        0,
+        std::move(nullMask));
+  }
+};
+
+/// Phase-1 ST_LineString(array(geometry)) for SpatialBench Q7.
+class StLineStringFunction : public CudfFunction {
+ public:
+  explicit StLineStringFunction(const core::TypedExprPtr& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 1, "ST_LineString expects 1 input");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    rmm::device_scalar<int32_t> invalid(0, stream, mr);
+    auto out = makeLineStringFromPointList(
+        asView(inputColumns[0]), invalid.data(), stream, mr);
+    throwIfInvalidGeometryType(invalid, stream);
+    return out;
+  }
+};
+
+/// Phase-1 ST_Length(linestring) for SpatialBench Q7.
+class StLengthFunction : public CudfFunction {
+ public:
+  explicit StLengthFunction(const core::TypedExprPtr& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 1, "ST_Length expects 1 input");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    rmm::device_scalar<int32_t> invalid(0, stream, mr);
+    auto out =
+        lineStringLength(asView(inputColumns[0]), invalid.data(), stream, mr);
+    throwIfInvalidGeometryType(invalid, stream);
+    return out;
+  }
 };
 
 } // namespace
@@ -3160,6 +3246,44 @@ bool registerBuiltinFunctions(const std::string& prefix) {
       {FunctionSignatureBuilder()
            .returnType("double")
            .argumentType("geometry")
+           .argumentType("geometry")
+           .build()});
+
+  registerCudfFunction(
+      "array_constructor",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* /*pool*/) {
+        return std::make_shared<ArrayConstructorFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .typeVariable("T")
+           .returnType("array(T)")
+           .argumentType("T")
+           .variableArity("T")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "st_linestring",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* /*pool*/) {
+        return std::make_shared<StLineStringFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("geometry")
+           .argumentType("array(geometry)")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "st_length",
+      [](const std::string&,
+         const core::TypedExprPtr& expr,
+         memory::MemoryPool* /*pool*/) {
+        return std::make_shared<StLengthFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("double")
            .argumentType("geometry")
            .build()});
 

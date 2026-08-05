@@ -362,5 +362,51 @@ TEST_F(CudfGeospatialTest, stDistancePointPolygonColumnQ8Shape) {
   EXPECT_NEAR(dists->valueAt(2), dSouth, 1e-9);
 }
 
+TEST_F(CudfGeospatialTest, stLengthLineStringQ7Shape) {
+  // SpatialBench Q7:
+  // ST_Length(ST_LineString(ARRAY[ST_GeomFromBinary(pickup),
+  //                                ST_GeomFromBinary(dropoff)])) / 0.000009
+  std::vector<std::string> pickups = {
+      makeWkbPoint(0.0, 0.0),
+      makeWkbPoint(-111.7610, 34.8697),
+      makeWkbPoint(1.0, 1.0),
+  };
+  std::vector<std::string> dropoffs = {
+      makeWkbPoint(3.0, 4.0), // length 5
+      makeWkbPoint(-111.6160, 34.8697), // east 0.145 degrees
+      makeWkbPoint(1.0, 2.0), // length 1
+  };
+  std::vector<StringView> pickupViews;
+  std::vector<StringView> dropoffViews;
+  for (const auto& s : pickups) {
+    pickupViews.emplace_back(s);
+  }
+  for (const auto& s : dropoffs) {
+    dropoffViews.emplace_back(s);
+  }
+  auto data = makeRowVector(
+      {"pickup", "dropoff"},
+      {makeFlatVector<StringView>(pickupViews, VARBINARY()),
+       makeFlatVector<StringView>(dropoffViews, VARBINARY())});
+
+  auto plan =
+      PlanBuilder()
+          .values({data})
+          .project(
+              {"ST_Length(ST_LineString(ARRAY[ST_GeomFromBinary(pickup), ST_GeomFromBinary(dropoff)])) / 0.000009"})
+          .planNode();
+
+  double d0 = 5.0 / 0.000009;
+  double d1 = 0.145 / 0.000009;
+  double d2 = 1.0 / 0.000009;
+
+  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto dists = result->childAt(0)->asFlatVector<double>();
+  ASSERT_EQ(dists->size(), 3);
+  EXPECT_NEAR(dists->valueAt(0), d0, 1e-6);
+  EXPECT_NEAR(dists->valueAt(1), d1, 1e-6);
+  EXPECT_NEAR(dists->valueAt(2), d2, 1e-6);
+}
+
 } // namespace
 

@@ -99,4 +99,21 @@ std::unique_ptr<cudf::column> geometryDistance(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);
 
+/// Build Velox LINESTRING blobs from a LIST of POINT geometry blobs
+/// (ST_LineString). Lists with < 2 points → empty LINESTRING. Non-POINT /
+/// empty / null / repeated consecutive points set *invalidTypeFlag.
+std::unique_ptr<cudf::column> makeLineStringFromPointList(
+    cudf::column_view const& pointLists,
+    int32_t* invalidTypeFlag,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
+/// Euclidean ST_Length for Velox LINESTRING / MULTI_LINE_STRING blobs
+/// (degree-space, matches CPU SpatialBench / GEOS getLength).
+std::unique_ptr<cudf::column> lineStringLength(
+    cudf::column_view const& geometry,
+    int32_t* invalidTypeFlag,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
 } // namespace facebook::velox::cudf_velox

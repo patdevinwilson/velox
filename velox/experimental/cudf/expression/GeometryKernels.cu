@@ -18,6 +18,7 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/lists/lists_column_view.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/bit.hpp>
@@ -44,12 +45,21 @@ namespace {
 
 // Must match GeometrySerializationType in GeometryConstants.h.
 constexpr uint8_t kPointTag = 0;
+constexpr uint8_t kLineStringTag = 2;
+constexpr uint8_t kMultiLineStringTag = 3;
 constexpr uint8_t kPolygonTag = 4;
 constexpr uint8_t kEnvelopeTag = 7;
 constexpr int32_t kPointBlobSize = 17; // 1 + 8 + 8
 constexpr int32_t kEsriPolygon = 5;
+constexpr int32_t kEsriPolyline = 3;
 constexpr int32_t kEmptyPolygonBlobSize = 45; // tag+esri+envelope+numParts+numPoints
+constexpr int32_t kEmptyLineStringBlobSize = 45;
 constexpr uint32_t kWkbSridFlag = 0x20000000u;
+
+__device__ inline int32_t veloxLineStringBlobSize(int32_t numPoints) {
+  // tag + esri + envelope + numParts + numPoints + partStarts[1] + xy
+  return kEmptyLineStringBlobSize + 4 + 16 * numPoints;
+}
 
 __device__ inline void markInvalid(int32_t* flag) {
   if (flag != nullptr) {
@@ -1304,6 +1314,338 @@ std::unique_ptr<cudf::column> geometryDistance(
           return;
         }
         outPtr[i] = dist;
+      });
+
+  out->set_null_count(
+      cudf::null_count(out->view().null_mask(), 0, size, stream));
+  return out;
+}
+
+std::unique_ptr<cudf::column> makeLineStringFromPointList(
+    cudf::column_view const& pointLists,
+    int32_t* invalidTypeFlag,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  CUDF_EXPECTS(
+      pointLists.type().id() == cudf::type_id::LIST,
+      "ST_LineString expects array(geometry)");
+
+  cudf::lists_column_view lists(pointLists);
+  auto const size = pointLists.size();
+  auto points = lists.get_sliced_child(stream);
+  CUDF_EXPECTS(
+      points.type().id() == cudf::type_id::STRING,
+      "ST_LineString array elements must be geometry/STRING");
+
+  cudf::strings_column_view pointStrings(points);
+  auto pointChars = pointStrings.chars_begin(stream);
+  auto pointOffsets = pointStrings.offsets().begin<cudf::size_type>();
+  auto pointNull = points.null_mask();
+  auto listOffsets = lists.offsets().begin<cudf::size_type>();
+  auto listNull = pointLists.null_mask();
+
+  auto [nullMaskBuf, nullCountHint] = [&]() {
+    if (pointLists.null_mask() != nullptr) {
+      auto buf = cudf::copy_bitmask(pointLists, stream, mr);
+      return std::make_pair(std::move(buf), pointLists.null_count());
+    }
+    return std::make_pair(
+        cudf::create_null_mask(size, cudf::mask_state::ALL_VALID, stream, mr),
+        0);
+  }();
+  (void)nullCountHint;
+  auto* outMask = static_cast<cudf::bitmask_type*>(nullMaskBuf.data());
+
+  rmm::device_uvector<cudf::size_type> sizes(size + 1, stream, mr);
+  auto* sizesPtr = sizes.data();
+
+  thrust::for_each_n(
+      rmm::exec_policy(stream),
+      thrust::counting_iterator<cudf::size_type>(0),
+      size + 1,
+      [sizesPtr,
+       listOffsets,
+       listNull,
+       pointOffsets,
+       pointChars,
+       pointNull,
+       outMask,
+       invalidTypeFlag,
+       size,
+       listNullCount = pointLists.null_count(),
+       pointNullCount = points.null_count()] __device__(cudf::size_type i) {
+        if (i == size) {
+          sizesPtr[i] = 0;
+          return;
+        }
+        if (listNullCount > 0 && listNull != nullptr &&
+            !cudf::bit_is_set(listNull, i)) {
+          sizesPtr[i] = 0;
+          return;
+        }
+        auto const begin = listOffsets[i];
+        auto const end = listOffsets[i + 1];
+        auto const n = end - begin;
+        if (n < 2) {
+          sizesPtr[i] = kEmptyLineStringBlobSize;
+          return;
+        }
+        // Validate points; size the blob.
+        double lastX = 0;
+        double lastY = 0;
+        bool haveLast = false;
+        for (cudf::size_type j = begin; j < end; ++j) {
+          if (pointNullCount > 0 && pointNull != nullptr &&
+              !cudf::bit_is_set(pointNull, j)) {
+            markInvalid(invalidTypeFlag);
+            sizesPtr[i] = 0;
+            cudf::clear_bit_unsafe(outMask, i);
+            return;
+          }
+          double x = 0;
+          double y = 0;
+          auto const ps = pointOffsets[j];
+          auto const pe = pointOffsets[j + 1];
+          if (!readPointXY(pointChars + ps, pe - ps, x, y, invalidTypeFlag)) {
+            sizesPtr[i] = 0;
+            cudf::clear_bit_unsafe(outMask, i);
+            return;
+          }
+          if (isEmptyPoint(x, y)) {
+            markInvalid(invalidTypeFlag);
+            sizesPtr[i] = 0;
+            cudf::clear_bit_unsafe(outMask, i);
+            return;
+          }
+          if (haveLast && x == lastX && y == lastY) {
+            markInvalid(invalidTypeFlag);
+            sizesPtr[i] = 0;
+            cudf::clear_bit_unsafe(outMask, i);
+            return;
+          }
+          lastX = x;
+          lastY = y;
+          haveLast = true;
+        }
+        sizesPtr[i] = static_cast<cudf::size_type>(
+            veloxLineStringBlobSize(static_cast<int32_t>(n)));
+      });
+
+  auto offsetsCol = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT32},
+      size + 1,
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      mr);
+  auto* offsets = offsetsCol->mutable_view().data<cudf::size_type>();
+  thrust::exclusive_scan(
+      rmm::exec_policy(stream), sizes.begin(), sizes.end(), offsets);
+
+  cudf::size_type totalChars = 0;
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      &totalChars,
+      offsets + size,
+      sizeof(cudf::size_type),
+      cudaMemcpyDeviceToHost,
+      stream.value()));
+  stream.synchronize();
+
+  rmm::device_uvector<char> chars(
+      static_cast<std::size_t>(totalChars), stream, mr);
+  auto* charsPtr = chars.data();
+
+  thrust::for_each_n(
+      rmm::exec_policy(stream),
+      thrust::counting_iterator<cudf::size_type>(0),
+      size,
+      [charsPtr,
+       offsets,
+       listOffsets,
+       listNull,
+       pointOffsets,
+       pointChars,
+       pointNull,
+       outMask,
+       invalidTypeFlag,
+       listNullCount = pointLists.null_count(),
+       pointNullCount = points.null_count()] __device__(cudf::size_type i) {
+        if (listNullCount > 0 && listNull != nullptr &&
+            !cudf::bit_is_set(listNull, i)) {
+          return;
+        }
+        if (!cudf::bit_is_set(outMask, i)) {
+          return;
+        }
+        auto const outStart = offsets[i];
+        auto const outEnd = offsets[i + 1];
+        auto const outLen = outEnd - outStart;
+        if (outLen <= 0) {
+          cudf::clear_bit_unsafe(outMask, i);
+          return;
+        }
+        char* out = charsPtr + outStart;
+        auto const begin = listOffsets[i];
+        auto const end = listOffsets[i + 1];
+        auto const n = end - begin;
+
+        if (n < 2) {
+          // Empty LINESTRING.
+          out[0] = static_cast<char>(kLineStringTag);
+          writeI32Native(out + 1, kEsriPolyline);
+          double const nan = NAN;
+          writeF64Native(out + 5, nan);
+          writeF64Native(out + 13, nan);
+          writeF64Native(out + 21, nan);
+          writeF64Native(out + 29, nan);
+          writeI32Native(out + 37, 0);
+          writeI32Native(out + 41, 0);
+          return;
+        }
+
+        out[0] = static_cast<char>(kLineStringTag);
+        writeI32Native(out + 1, kEsriPolyline);
+        writeI32Native(out + 37, 1); // numParts
+        writeI32Native(out + 41, static_cast<int32_t>(n));
+        writeI32Native(out + 45, 0); // partStarts[0]
+        char* xyPtr = out + 49;
+
+        double xmin = INFINITY;
+        double ymin = INFINITY;
+        double xmax = -INFINITY;
+        double ymax = -INFINITY;
+        int32_t pointIdx = 0;
+        for (cudf::size_type j = begin; j < end; ++j) {
+          double x = 0;
+          double y = 0;
+          auto const ps = pointOffsets[j];
+          auto const pe = pointOffsets[j + 1];
+          if (!readPointXY(pointChars + ps, pe - ps, x, y, invalidTypeFlag)) {
+            cudf::clear_bit_unsafe(outMask, i);
+            return;
+          }
+          xmin = fmin(xmin, x);
+          ymin = fmin(ymin, y);
+          xmax = fmax(xmax, x);
+          ymax = fmax(ymax, y);
+          writeF64Native(xyPtr + static_cast<std::size_t>(pointIdx) * 16, x);
+          writeF64Native(
+              xyPtr + static_cast<std::size_t>(pointIdx) * 16 + 8, y);
+          ++pointIdx;
+        }
+        writeF64Native(out + 5, xmin);
+        writeF64Native(out + 13, ymin);
+        writeF64Native(out + 21, xmax);
+        writeF64Native(out + 29, ymax);
+      });
+
+  auto nullCount = cudf::null_count(
+      static_cast<cudf::bitmask_type const*>(nullMaskBuf.data()),
+      0,
+      size,
+      stream);
+  return cudf::make_strings_column(
+      size,
+      std::move(offsetsCol),
+      chars.release(),
+      nullCount,
+      std::move(nullMaskBuf));
+}
+
+std::unique_ptr<cudf::column> lineStringLength(
+    cudf::column_view const& geometry,
+    int32_t* invalidTypeFlag,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  CUDF_EXPECTS(
+      geometry.type().id() == cudf::type_id::STRING,
+      "ST_Length expects geometry/STRING");
+
+  cudf::strings_column_view strings(geometry);
+  auto const size = geometry.size();
+  auto out = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::FLOAT64},
+      size,
+      cudf::mask_state::ALL_VALID,
+      stream,
+      mr);
+  auto* outPtr = out->mutable_view().data<double>();
+  auto outMask =
+      static_cast<cudf::bitmask_type*>(out->mutable_view().null_mask());
+
+  auto chars = strings.chars_begin(stream);
+  auto offsets = strings.offsets().begin<cudf::size_type>();
+  auto inNull = geometry.null_mask();
+
+  thrust::for_each_n(
+      rmm::exec_policy(stream),
+      thrust::counting_iterator<cudf::size_type>(0),
+      size,
+      [chars,
+       offsets,
+       inNull,
+       outPtr,
+       outMask,
+       invalidTypeFlag,
+       nullCount = geometry.null_count()] __device__(cudf::size_type i) {
+        if (nullCount > 0 && inNull != nullptr &&
+            !cudf::bit_is_set(inNull, i)) {
+          cudf::clear_bit_unsafe(outMask, i);
+          return;
+        }
+        auto const start = offsets[i];
+        auto const end = offsets[i + 1];
+        auto const len = end - start;
+        char const* data = chars + start;
+        if (len < kEmptyLineStringBlobSize) {
+          markInvalid(invalidTypeFlag);
+          cudf::clear_bit_unsafe(outMask, i);
+          return;
+        }
+        uint8_t const tag = static_cast<uint8_t>(data[0]);
+        if (tag != kLineStringTag && tag != kMultiLineStringTag) {
+          markInvalid(invalidTypeFlag);
+          cudf::clear_bit_unsafe(outMask, i);
+          return;
+        }
+        int32_t const numParts = readI32Native(data + 37);
+        int32_t const numPoints = readI32Native(data + 41);
+        if (numParts <= 0 || numPoints <= 1) {
+          outPtr[i] = 0.0;
+          return;
+        }
+        std::size_t const partsBytes =
+            static_cast<std::size_t>(numParts) * sizeof(int32_t);
+        std::size_t const xyBytes =
+            static_cast<std::size_t>(numPoints) * 16;
+        if (static_cast<std::size_t>(len) <
+            static_cast<std::size_t>(kEmptyLineStringBlobSize) + partsBytes +
+                xyBytes) {
+          markInvalid(invalidTypeFlag);
+          cudf::clear_bit_unsafe(outMask, i);
+          return;
+        }
+        char const* partPtr = data + kEmptyLineStringBlobSize;
+        char const* xy = partPtr + partsBytes;
+
+        double total = 0.0;
+        for (int32_t p = 0; p < numParts; ++p) {
+          int32_t const ps = readI32Native(
+              partPtr + static_cast<std::size_t>(p) * 4);
+          int32_t const pe = (p + 1 < numParts)
+              ? readI32Native(
+                    partPtr + static_cast<std::size_t>(p + 1) * 4)
+              : numPoints;
+          for (int32_t k = ps; k + 1 < pe; ++k) {
+            double const x0 = xyBytesX(xy, k);
+            double const y0 = xyBytesY(xy, k);
+            double const x1 = xyBytesX(xy, k + 1);
+            double const y1 = xyBytesY(xy, k + 1);
+            double const dx = x1 - x0;
+            double const dy = y1 - y0;
+            total += sqrt(dx * dx + dy * dy);
+          }
+        }
+        outPtr[i] = total;
       });
 
   out->set_null_count(

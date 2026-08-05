@@ -4062,10 +4062,10 @@ TEST_F(GeometryFunctionsTest, testStLineString) {
   // < 2 Points returns empty
   testStLineStringFunc({{"POINT (1 2)"}}, "LINESTRING EMPTY");
   testStLineStringFunc(common::testutil::optionalEmpty, "LINESTRING EMPTY");
-  // Duplicate consecutive points throws exception
-  VELOX_ASSERT_USER_THROW(
-      testStLineStringFunc({{"POINT (1 2)", "POINT (1 2)"}}, std::nullopt),
-      "Repeated point sequence in ST_LineString: point 1,2 at index 1.");
+  // Consecutive duplicate points are allowed (Sedona ST_MakeLine / SpatialBench
+  // Q7 parity). Zero-length segments contribute 0 to ST_Length.
+  testStLineStringFunc(
+      {{"POINT (1 2)", "POINT (1 2)"}}, "LINESTRING (1 2, 1 2)");
   // Only points can be passed
   VELOX_ASSERT_USER_THROW(
       testStLineStringFunc(

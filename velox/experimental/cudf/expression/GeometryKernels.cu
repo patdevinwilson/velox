@@ -1391,9 +1391,6 @@ std::unique_ptr<cudf::column> makeLineStringFromPointList(
           return;
         }
         // Validate points; size the blob.
-        double lastX = 0;
-        double lastY = 0;
-        bool haveLast = false;
         for (cudf::size_type j = begin; j < end; ++j) {
           if (pointNullCount > 0 && pointNull != nullptr &&
               !cudf::bit_is_set(pointNull, j)) {
@@ -1417,15 +1414,7 @@ std::unique_ptr<cudf::column> makeLineStringFromPointList(
             cudf::clear_bit_unsafe(outMask, i);
             return;
           }
-          if (haveLast && x == lastX && y == lastY) {
-            markInvalid(invalidTypeFlag);
-            sizesPtr[i] = 0;
-            cudf::clear_bit_unsafe(outMask, i);
-            return;
-          }
-          lastX = x;
-          lastY = y;
-          haveLast = true;
+          // Consecutive duplicates allowed (Sedona ST_MakeLine / Q7 parity).
         }
         sizesPtr[i] = static_cast<cudf::size_type>(
             veloxLineStringBlobSize(static_cast<int32_t>(n)));

@@ -32,6 +32,7 @@
 #include "velox/expression/FieldReference.h"
 #include "velox/expression/FunctionSignature.h"
 #include "velox/expression/SignatureBinder.h"
+#include "velox/functions/prestosql/types/GeometryRegistration.h"
 #include "velox/type/DecimalUtil.h"
 #include "velox/type/Time.h"
 #include "velox/type/Type.h"
@@ -2500,7 +2501,8 @@ class StDistanceFunction : public CudfFunction {
 /// Required for SpatialBench Q7: ST_LineString(ARRAY[...]).
 class ArrayConstructorFunction : public CudfFunction {
  public:
-  explicit ArrayConstructorFunction(const core::TypedExprPtr& expr) {
+  explicit ArrayConstructorFunction(
+      const std::shared_ptr<velox::exec::Expr>& expr) {
     VELOX_CHECK(
         !expr->inputs().empty(),
         "GPU array_constructor requires at least one argument");
@@ -2508,6 +2510,7 @@ class ArrayConstructorFunction : public CudfFunction {
 
   ColumnOrView eval(
       std::vector<ColumnOrView>& inputColumns,
+      [[maybe_unused]] cudf::size_type /*numRowsArg*/,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     VELOX_CHECK(!inputColumns.empty());
@@ -2543,12 +2546,14 @@ class ArrayConstructorFunction : public CudfFunction {
 /// Phase-1 ST_LineString(array(geometry)) for SpatialBench Q7.
 class StLineStringFunction : public CudfFunction {
  public:
-  explicit StLineStringFunction(const core::TypedExprPtr& expr) {
+  explicit StLineStringFunction(
+      const std::shared_ptr<velox::exec::Expr>& expr) {
     VELOX_CHECK_EQ(expr->inputs().size(), 1, "ST_LineString expects 1 input");
   }
 
   ColumnOrView eval(
       std::vector<ColumnOrView>& inputColumns,
+      [[maybe_unused]] cudf::size_type numRows,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     rmm::device_scalar<int32_t> invalid(0, stream, mr);
@@ -2562,12 +2567,13 @@ class StLineStringFunction : public CudfFunction {
 /// Phase-1 ST_Length(linestring) for SpatialBench Q7.
 class StLengthFunction : public CudfFunction {
  public:
-  explicit StLengthFunction(const core::TypedExprPtr& expr) {
+  explicit StLengthFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
     VELOX_CHECK_EQ(expr->inputs().size(), 1, "ST_Length expects 1 input");
   }
 
   ColumnOrView eval(
       std::vector<ColumnOrView>& inputColumns,
+      [[maybe_unused]] cudf::size_type numRows,
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const override {
     rmm::device_scalar<int32_t> invalid(0, stream, mr);
@@ -3232,6 +3238,10 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   // Note: Spark and Presto functions are now registered separately via
   // registerSparkFunctions() and registerPrestoFunctions()
 
+  // Presto registers cuDF before prestosql scalar functions (which own
+  // Geometry type registration). Ensure GEOMETRY exists before ST_* signatures.
+  registerGeometryType();
+
   registerCudfFunction(
       prefix + "great_circle_distance",
       [](const std::string&,
@@ -3306,8 +3316,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   registerCudfFunction(
       "array_constructor",
       [](const std::string&,
-         const core::TypedExprPtr& expr,
-         memory::MemoryPool* /*pool*/) {
+         const std::shared_ptr<velox::exec::Expr>& expr) {
         return std::make_shared<ArrayConstructorFunction>(expr);
       },
       {FunctionSignatureBuilder()
@@ -3320,8 +3329,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   registerCudfFunction(
       prefix + "st_linestring",
       [](const std::string&,
-         const core::TypedExprPtr& expr,
-         memory::MemoryPool* /*pool*/) {
+         const std::shared_ptr<velox::exec::Expr>& expr) {
         return std::make_shared<StLineStringFunction>(expr);
       },
       {FunctionSignatureBuilder()
@@ -3332,8 +3340,7 @@ bool registerBuiltinFunctions(const std::string& prefix) {
   registerCudfFunction(
       prefix + "st_length",
       [](const std::string&,
-         const core::TypedExprPtr& expr,
-         memory::MemoryPool* /*pool*/) {
+         const std::shared_ptr<velox::exec::Expr>& expr) {
         return std::make_shared<StLengthFunction>(expr);
       },
       {FunctionSignatureBuilder()

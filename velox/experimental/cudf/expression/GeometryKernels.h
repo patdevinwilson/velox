@@ -116,4 +116,63 @@ std::unique_ptr<cudf::column> lineStringLength(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);
 
+/// Per-row axis-aligned envelopes from Velox geometry STRING blobs.
+/// POINT → (x,x,y,y); POLYGON/LINESTRING/MULTI_* → embedded envelope @ byte 5;
+/// ENVELOPE → 4 doubles @ byte 1. Empty/NaN → null row.
+/// If expandBy has size == geometry.size(), expands each envelope by that
+/// row's radius (CPU SpatialJoinBuild::readEnvelope semantics). If expandBy
+/// is empty, uses constantExpandBy.
+struct GeometryEnvelopes {
+  std::unique_ptr<cudf::column> minX;
+  std::unique_ptr<cudf::column> minY;
+  std::unique_ptr<cudf::column> maxX;
+  std::unique_ptr<cudf::column> maxY;
+};
+
+GeometryEnvelopes extractGeometryEnvelopes(
+    cudf::column_view const& geometry,
+    cudf::column_view const& expandBy,
+    double constantExpandBy,
+    int32_t* invalidTypeFlag,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
+/// Cross-product envelope intersection: returns compacted (probeIndex,
+/// buildIndex) pairs where probe and (already-expanded) build envelopes
+/// intersect. Mirrors CPU SpatialIndex pruning before ST_Distance.
+std::pair<std::unique_ptr<cudf::column>, std::unique_ptr<cudf::column>>
+geometryEnvelopeCrossIntersectIndices(
+    GeometryEnvelopes const& probe,
+    GeometryEnvelopes const& build,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
+/// Uniform grid over build envelopes for O(candidates) probe queries.
+/// Takes ownership of `buildEnvelopes`.
+struct GeometryEnvelopeGrid {
+  double originX{0};
+  double originY{0};
+  double invCellW{0};
+  double invCellH{0};
+  int32_t nCols{0};
+  int32_t nRows{0};
+  GeometryEnvelopes envelopes;
+  std::unique_ptr<cudf::column> cellOffsets; // int32, nCells + 1
+  std::unique_ptr<cudf::column> cellBuildIndices; // size_type
+};
+
+GeometryEnvelopeGrid buildGeometryEnvelopeGrid(
+    GeometryEnvelopes buildEnvelopes,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
+/// Probe the grid with probe envelopes; returns compacted (probeIdx, buildIdx)
+/// pairs that pass AABB intersection (same contract as SpatialIndex::query).
+std::pair<std::unique_ptr<cudf::column>, std::unique_ptr<cudf::column>>
+queryGeometryEnvelopeGrid(
+    GeometryEnvelopeGrid const& grid,
+    GeometryEnvelopes const& probe,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
 } // namespace facebook::velox::cudf_velox

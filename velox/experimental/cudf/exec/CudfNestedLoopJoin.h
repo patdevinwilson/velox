@@ -18,6 +18,7 @@
 
 #include "velox/experimental/cudf/exec/CudfOperator.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
+#include "velox/experimental/cudf/expression/GeometryKernels.h"
 #include "velox/experimental/cudf/expression/PrecomputeInstruction.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -32,10 +33,21 @@
 #include <rmm/cuda_stream_view.hpp>
 
 #include <memory>
+#include <optional>
+#include <string>
 
 namespace facebook::velox::cudf_velox {
 
 class CudaEvent;
+
+/// Optional envelope pruning metadata for SpatialJoin → NLJ. Probe envelopes
+/// are unexpanded; build envelopes are expanded by the per-row radius column
+/// (CPU SpatialJoinBuild semantics) before intersection tests.
+struct SpatialEnvelopePrune {
+  std::string probeGeometryName;
+  std::string buildGeometryName;
+  std::optional<std::string> buildRadiusName;
+};
 
 /// Coordinates data transfer from build to probe operators for nested loop
 /// join. Build operators accumulate batches, then one operator transfers them
@@ -149,7 +161,8 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   CudfNestedLoopJoinProbe(
       int32_t operatorId,
       exec::DriverCtx* driverCtx,
-      std::shared_ptr<const core::NestedLoopJoinNode> joinNode);
+      std::shared_ptr<const core::NestedLoopJoinNode> joinNode,
+      std::optional<SpatialEnvelopePrune> spatialPrune = std::nullopt);
 
   void initialize() override;
 
@@ -203,6 +216,20 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   /// Ensures build-stream data is visible on the given probe stream.
   void syncBuildStream(rmm::cuda_stream_view probeStream);
 
+  /// Evaluates a join condition that isn't AST-representable (e.g.
+  /// ST_Distance(probe_g, build_g) <= radius) by materializing the probe x
+  /// build cross product and running filterEvaluator_ over it. Returns
+  /// (probeIndex, buildIndex) pairs where the condition holds, matching
+  /// cudf::conditional_inner_join's output shape. needBuildIndices=false skips
+  /// building the build-index column for callers that don't need it (e.g. left
+  /// semi project).
+  std::pair<std::unique_ptr<cudf::column>, std::unique_ptr<cudf::column>>
+  crossJoinConditionalIndices(
+      cudf::table_view probeTableView,
+      cudf::table_view buildView,
+      rmm::cuda_stream_view stream,
+      bool needBuildIndices = true);
+
   bool isLeftOrFullJoin() const {
     return joinType_ == core::JoinType::kLeft ||
         joinType_ == core::JoinType::kFull;
@@ -226,6 +253,13 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   // each table view before it is passed to cuDF join APIs.
   std::vector<PrecomputeInstruction> leftPrecomputeInstructions_;
   std::vector<PrecomputeInstruction> rightPrecomputeInstructions_;
+
+  // False when the join condition has a non-AST-representable sub-expression
+  // spanning both sides (see crossJoinConditionalIndices). In that case
+  // tree_/scalars_/*PrecomputeInstructions_ above are unused (left empty) and
+  // filterEvaluator_ below evaluates the whole condition instead.
+  bool useAstFilter_{true};
+  std::shared_ptr<CudfExpression> filterEvaluator_;
 
   // Output column mapping resolved by name from the output type.
   // Handles arbitrary column ordering (e.g., {"b0", "p0"}).
@@ -278,6 +312,23 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   // CUDA stream synchronization for build data visibility.
   std::optional<rmm::cuda_stream_view> buildStream_;
   std::unique_ptr<CudaEvent> cudaEvent_;
+
+  // SpatialJoin envelope prune (optional). GPU uniform grid over build
+  // envelopes; ST_Distance runs only on AABB candidates.
+  void ensureSpatialIndex(rmm::cuda_stream_view stream);
+
+  std::pair<std::unique_ptr<cudf::column>, std::unique_ptr<cudf::column>>
+  spatialPruneConditionalIndices(
+      cudf::table_view probeTableView,
+      cudf::table_view buildView,
+      rmm::cuda_stream_view stream,
+      bool needBuildIndices);
+
+  std::optional<SpatialEnvelopePrune> spatialPrune_;
+  cudf::size_type probeGeomChannel_{0};
+  cudf::size_type buildGeomChannel_{0};
+  std::optional<cudf::size_type> buildRadiusChannel_;
+  std::optional<GeometryEnvelopeGrid> buildEnvelopeGrid_;
 };
 
 /// Creates CUDF nested loop join operators and bridges.
@@ -288,11 +339,17 @@ class CudfNestedLoopJoinBridgeTranslator
   std::unique_ptr<exec::Operator>
   toOperator(exec::DriverCtx* ctx, int32_t id, const core::PlanNodePtr& node);
 
-  /// Creates a CudfNestedLoopJoinBridge for the given plan node.
+  /// Creates a CudfNestedLoopJoinBridge for NestedLoopJoin or SpatialJoin.
   std::unique_ptr<exec::JoinBridge> toJoinBridge(const core::PlanNodePtr& node);
 
   /// Returns a supplier that creates CudfNestedLoopJoinBuild operators.
   exec::OperatorSupplier toOperatorSupplier(const core::PlanNodePtr& node);
 };
+
+/// Synthesize a NestedLoopJoinNode from SpatialJoinNode so SpatialJoin can
+/// reuse CudfNestedLoopJoin (GPU evaluates the join condition as a conditional
+/// cross join; envelope pruning uses the CPU SpatialIndex when available).
+std::shared_ptr<const core::NestedLoopJoinNode> nestedLoopJoinFromSpatialJoin(
+    const std::shared_ptr<const core::SpatialJoinNode>& spatialJoin);
 
 } // namespace facebook::velox::cudf_velox

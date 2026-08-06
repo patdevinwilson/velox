@@ -465,9 +465,16 @@ struct GroupbyMeanAggregator : GroupbyAggregator {
       rmm::device_async_resource_ref mr) override {
     const auto& outputType = asRowType(resultType);
     switch (step) {
-      case core::AggregationNode::Step::kSingle:
-        return std::move(results[meanIdx_].results[0]);
-      case core::AggregationNode::Step::kPartial: {
+      case core::AggregationNode::Step::kSingle: {
+        auto col = std::move(results[meanIdx_].results[0]);
+        const auto cudfOutputType =
+            cudf_velox::veloxToCudfDataType(resultType);
+        // mean() is float64; Presto AVG(INTERVAL) returns INTERVAL (int64 ms).
+        if (col->type() != cudfOutputType) {
+          col = cudf::cast(*col, cudfOutputType, stream, mr);
+        }
+        return col;
+      }      case core::AggregationNode::Step::kPartial: {
         auto sum = std::move(results[sumIdx_].results[0]);
         auto count = std::move(results[sumIdx_].results[1]);
 

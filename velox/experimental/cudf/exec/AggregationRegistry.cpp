@@ -348,6 +348,11 @@ void registerCommonAggregationFunctions(
       FunctionSignatureBuilder()
           .returnType("double")
           .argumentType("double")
+          .build(),
+      // Presto AVG(INTERVAL DAY TO SECOND) → INTERVAL DAY TO SECOND (Q3).
+      FunctionSignatureBuilder()
+          .returnType("interval day to second")
+          .argumentType("interval day to second")
           .build()};
 
   auto decimalAvgSingle = std::vector<exec::FunctionSignaturePtr>{
@@ -408,6 +413,10 @@ void registerCommonAggregationFunctions(
       FunctionSignatureBuilder()
           .returnType("row(double,bigint)")
           .argumentType("double")
+          .build(),
+      FunctionSignatureBuilder()
+          .returnType("row(double,bigint)")
+          .argumentType("interval day to second")
           .build()};
 
   avgPartialSignatures.insert(
@@ -424,6 +433,10 @@ void registerCommonAggregationFunctions(
   auto avgFinalIntermediateSignatures = std::vector<exec::FunctionSignaturePtr>{
       FunctionSignatureBuilder()
           .returnType("double")
+          .argumentType("row(double,bigint)")
+          .build(),
+      FunctionSignatureBuilder()
+          .returnType("interval day to second")
           .argumentType("row(double,bigint)")
           .build()};
 

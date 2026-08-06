@@ -2497,6 +2497,65 @@ class StDistanceFunction : public CudfFunction {
   bool polygonOnLeft_{false};
 };
 
+/// TIMESTAMP - TIMESTAMP → INTERVAL DAY TO SECOND (milliseconds), matching
+/// Presto TimestampMinusFunction. Needed for SpatialBench Q3:
+/// AVG(t_dropofftime - t_pickuptime).
+class TimestampMinusFunction : public CudfFunction {
+ public:
+  explicit TimestampMinusFunction(
+      const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 2, "minus expects 2 inputs");
+    VELOX_CHECK(
+        expr->inputs()[0]->type()->isTimestamp() &&
+            expr->inputs()[1]->type()->isTimestamp(),
+        "GPU timestamp minus expects TIMESTAMP inputs, got {} and {}",
+        expr->inputs()[0]->type()->toString(),
+        expr->inputs()[1]->type()->toString());
+    VELOX_CHECK(
+        expr->type()->isIntervalDayTime(),
+        "GPU timestamp minus expects INTERVAL DAY TO SECOND result, got {}",
+        expr->type()->toString());
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      [[maybe_unused]] cudf::size_type numRows,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    auto left = asView(inputColumns[0]);
+    auto right = asView(inputColumns[1]);
+    auto millisType =
+        cudf::data_type{cudf::type_id::TIMESTAMP_MILLISECONDS};
+    auto leftMs = left.type().id() == cudf::type_id::TIMESTAMP_MILLISECONDS
+        ? nullptr
+        : cudf::cast(left, millisType, stream, mr);
+    auto rightMs = right.type().id() == cudf::type_id::TIMESTAMP_MILLISECONDS
+        ? nullptr
+        : cudf::cast(right, millisType, stream, mr);
+    auto leftView = leftMs ? leftMs->view() : left;
+    auto rightView = rightMs ? rightMs->view() : right;
+
+    // timestamp_ms - timestamp_ms → duration_ms; bitcast to int64 millis.
+    auto diff = cudf::binary_operation(
+        leftView,
+        rightView,
+        cudf::binary_operator::SUB,
+        cudf::data_type{cudf::type_id::DURATION_MILLISECONDS},
+        stream,
+        mr);
+    return std::make_unique<cudf::column>(
+        cudf::column_view{
+            cudf::data_type{cudf::type_id::INT64},
+            diff->size(),
+            diff->view().head<int64_t>(),
+            diff->view().null_mask(),
+            diff->null_count(),
+            diff->view().offset()},
+        stream,
+        mr);
+  }
+};
+
 /// Build array(T) from N columns of T via interleave + fixed-size lists.
 /// Required for SpatialBench Q7: ST_LineString(ARRAY[...]).
 class ArrayConstructorFunction : public CudfFunction {
@@ -3047,6 +3106,18 @@ bool registerBuiltinFunctions(const std::string& prefix) {
       {prefix + "plus", prefix + "add"}, cudf::binary_operator::ADD);
   registerBinaryOp(
       {prefix + "minus", prefix + "subtract"}, cudf::binary_operator::SUB);
+  // TIMESTAMP - TIMESTAMP → INTERVAL (Presto); numeric minus stays above.
+  registerCudfFunction(
+      prefix + "minus",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<TimestampMinusFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("interval day to second")
+           .argumentType("timestamp")
+           .argumentType("timestamp")
+           .build()});
   registerBinaryOp({prefix + "multiply"}, cudf::binary_operator::MUL);
   registerBinaryOp({prefix + "divide"}, cudf::binary_operator::DIV);
   registerBinaryOp({prefix + "mod"}, cudf::binary_operator::MOD);
@@ -3313,8 +3384,8 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .argumentType("geometry")
            .build()});
 
-  registerCudfFunction(
-      "array_constructor",
+  registerCudfFunctions(
+      {prefix + "array_constructor", "array_constructor"},
       [](const std::string&,
          const std::shared_ptr<velox::exec::Expr>& expr) {
         return std::make_shared<ArrayConstructorFunction>(expr);

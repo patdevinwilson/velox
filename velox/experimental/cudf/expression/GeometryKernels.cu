@@ -27,13 +27,23 @@
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 
+#include <thrust/copy.h>
+#include <thrust/distance.h>
 #include <thrust/for_each.h>
 #include <thrust/iterator/counting_iterator.h>
+#include <thrust/iterator/zip_iterator.h>
+#include <thrust/reduce.h>
 #include <thrust/scan.h>
+#include <thrust/sort.h>
+#include <thrust/transform_reduce.h>
+#include <thrust/tuple.h>
+#include <thrust/unique.h>
 
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1640,6 +1650,859 @@ std::unique_ptr<cudf::column> lineStringLength(
   out->set_null_count(
       cudf::null_count(out->view().null_mask(), 0, size, stream));
   return out;
+}
+
+namespace {
+
+__device__ inline bool readEnvelopeFromBlob(
+    char const* data,
+    cudf::size_type len,
+    double& minX,
+    double& minY,
+    double& maxX,
+    double& maxY,
+    int32_t* invalidTypeFlag) {
+  if (len < 1) {
+    markInvalid(invalidTypeFlag);
+    return false;
+  }
+  uint8_t const tag = static_cast<uint8_t>(data[0]);
+  if (tag == kPointTag) {
+    double x = 0;
+    double y = 0;
+    if (!readPointXY(data, len, x, y, invalidTypeFlag)) {
+      return false;
+    }
+    if (isEmptyPoint(x, y)) {
+      return false;
+    }
+    minX = maxX = x;
+    minY = maxY = y;
+    return true;
+  }
+  if (tag == kEnvelopeTag) {
+    if (len < 1 + 32) {
+      markInvalid(invalidTypeFlag);
+      return false;
+    }
+    minX = readF64Native(data + 1);
+    minY = readF64Native(data + 9);
+    maxX = readF64Native(data + 17);
+    maxY = readF64Native(data + 25);
+  } else if (
+      tag == kPolygonTag || tag == kLineStringTag ||
+      tag == kMultiLineStringTag) {
+    // tag(1) + esri(4) + xmin,ymin,xmax,ymax
+    if (len < 5 + 32) {
+      markInvalid(invalidTypeFlag);
+      return false;
+    }
+    minX = readF64Native(data + 5);
+    minY = readF64Native(data + 13);
+    maxX = readF64Native(data + 21);
+    maxY = readF64Native(data + 29);
+  } else {
+    markInvalid(invalidTypeFlag);
+    return false;
+  }
+  if (isnan(minX) || isnan(minY) || isnan(maxX) || isnan(maxY)) {
+    return false;
+  }
+  return true;
+}
+
+__device__ inline bool envelopesIntersect(
+    double aMinX,
+    double aMinY,
+    double aMaxX,
+    double aMaxY,
+    double bMinX,
+    double bMinY,
+    double bMaxX,
+    double bMaxY) {
+  return (aMaxX >= bMinX) && (aMinX <= bMaxX) && (aMaxY >= bMinY) &&
+      (aMinY <= bMaxY);
+}
+
+} // namespace
+
+GeometryEnvelopes extractGeometryEnvelopes(
+    cudf::column_view const& geometry,
+    cudf::column_view const& expandBy,
+    double constantExpandBy,
+    int32_t* invalidTypeFlag,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  CUDF_EXPECTS(
+      geometry.type().id() == cudf::type_id::STRING,
+      "geometry input must be STRING/VARBINARY");
+  bool const perRowExpand = expandBy.size() == geometry.size();
+  if (perRowExpand) {
+    CUDF_EXPECTS(
+        expandBy.type().id() == cudf::type_id::FLOAT64,
+        "expandBy must be FLOAT64");
+  }
+
+  cudf::strings_column_view geomStr(geometry);
+  auto const size = geometry.size();
+  auto makeCol = [&]() {
+    return cudf::make_numeric_column(
+        cudf::data_type{cudf::type_id::FLOAT64},
+        size,
+        cudf::mask_state::ALL_VALID,
+        stream,
+        mr);
+  };
+  GeometryEnvelopes out{
+      makeCol(), makeCol(), makeCol(), makeCol()};
+  auto* minX = out.minX->mutable_view().data<double>();
+  auto* minY = out.minY->mutable_view().data<double>();
+  auto* maxX = out.maxX->mutable_view().data<double>();
+  auto* maxY = out.maxY->mutable_view().data<double>();
+  auto outMask =
+      static_cast<cudf::bitmask_type*>(out.minX->mutable_view().null_mask());
+  // Share one null mask across all four columns: copy after fill.
+  auto chars = geomStr.chars_begin(stream);
+  auto offsets = geomStr.offsets().begin<cudf::size_type>();
+  auto geomNull = geometry.null_mask();
+  auto expandPtr =
+      perRowExpand ? expandBy.data<double>() : static_cast<double const*>(nullptr);
+  auto expandNull = perRowExpand ? expandBy.null_mask() : nullptr;
+
+  thrust::for_each_n(
+      rmm::exec_policy(stream),
+      thrust::counting_iterator<cudf::size_type>(0),
+      size,
+      [chars,
+       offsets,
+       geomNull,
+       expandPtr,
+       expandNull,
+       constantExpandBy,
+       perRowExpand,
+       minX,
+       minY,
+       maxX,
+       maxY,
+       outMask,
+       invalidTypeFlag] __device__(cudf::size_type i) {
+        if (geomNull && !cudf::bit_is_set(geomNull, i)) {
+          cudf::clear_bit_unsafe(outMask, i);
+          return;
+        }
+        if (perRowExpand && expandNull && !cudf::bit_is_set(expandNull, i)) {
+          cudf::clear_bit_unsafe(outMask, i);
+          return;
+        }
+        auto const start = offsets[i];
+        auto const end = offsets[i + 1];
+        double eMinX = 0, eMinY = 0, eMaxX = 0, eMaxY = 0;
+        if (!readEnvelopeFromBlob(
+                chars + start,
+                end - start,
+                eMinX,
+                eMinY,
+                eMaxX,
+                eMaxY,
+                invalidTypeFlag)) {
+          cudf::clear_bit_unsafe(outMask, i);
+          return;
+        }
+        double radius = constantExpandBy;
+        if (perRowExpand) {
+          radius = expandPtr[i];
+        }
+        radius = fmax(radius, 0.0);
+        minX[i] = eMinX - radius;
+        minY[i] = eMinY - radius;
+        maxX[i] = eMaxX + radius;
+        maxY[i] = eMaxY + radius;
+      });
+
+  auto nullCount =
+      cudf::null_count(out.minX->view().null_mask(), 0, size, stream);
+  out.minX->set_null_count(nullCount);
+  // Propagate the same null mask to the other three columns.
+  auto maskBytes = cudf::bitmask_allocation_size_bytes(size);
+  for (auto* col : {out.minY.get(), out.maxX.get(), out.maxY.get()}) {
+    auto dst = static_cast<cudf::bitmask_type*>(col->mutable_view().null_mask());
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        dst,
+        out.minX->view().null_mask(),
+        maskBytes,
+        cudaMemcpyDeviceToDevice,
+        stream.value()));
+    col->set_null_count(nullCount);
+  }
+  return out;
+}
+
+std::pair<std::unique_ptr<cudf::column>, std::unique_ptr<cudf::column>>
+geometryEnvelopeCrossIntersectIndices(
+    GeometryEnvelopes const& probe,
+    GeometryEnvelopes const& build,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  auto const numProbe = probe.minX->size();
+  auto const numBuild = build.minX->size();
+  if (numProbe == 0 || numBuild == 0) {
+    return {
+        cudf::make_empty_column(cudf::type_to_id<cudf::size_type>()),
+        cudf::make_empty_column(cudf::type_to_id<cudf::size_type>())};
+  }
+  auto const total =
+      static_cast<int64_t>(numProbe) * static_cast<int64_t>(numBuild);
+  CUDF_EXPECTS(
+      total <= std::numeric_limits<cudf::size_type>::max(),
+      "envelope cross product exceeds cudf::size_type");
+
+  rmm::device_uvector<uint8_t> flags(static_cast<size_t>(total), stream, mr);
+  auto* flagsPtr = flags.data();
+  auto pMinX = probe.minX->view().data<double>();
+  auto pMinY = probe.minY->view().data<double>();
+  auto pMaxX = probe.maxX->view().data<double>();
+  auto pMaxY = probe.maxY->view().data<double>();
+  auto pNull = probe.minX->view().null_mask();
+  auto bMinX = build.minX->view().data<double>();
+  auto bMinY = build.minY->view().data<double>();
+  auto bMaxX = build.maxX->view().data<double>();
+  auto bMaxY = build.maxY->view().data<double>();
+  auto bNull = build.minX->view().null_mask();
+
+  thrust::for_each_n(
+      rmm::exec_policy(stream),
+      thrust::counting_iterator<int64_t>(0),
+      total,
+      [flagsPtr,
+       numBuild,
+       pMinX,
+       pMinY,
+       pMaxX,
+       pMaxY,
+       pNull,
+       bMinX,
+       bMinY,
+       bMaxX,
+       bMaxY,
+       bNull] __device__(int64_t idx) {
+        auto const pi = static_cast<cudf::size_type>(idx / numBuild);
+        auto const bj = static_cast<cudf::size_type>(idx % numBuild);
+        if ((pNull && !cudf::bit_is_set(pNull, pi)) ||
+            (bNull && !cudf::bit_is_set(bNull, bj))) {
+          flagsPtr[idx] = 0;
+          return;
+        }
+        flagsPtr[idx] = envelopesIntersect(
+                            pMinX[pi],
+                            pMinY[pi],
+                            pMaxX[pi],
+                            pMaxY[pi],
+                            bMinX[bj],
+                            bMinY[bj],
+                            bMaxX[bj],
+                            bMaxY[bj])
+            ? 1
+            : 0;
+      });
+
+  rmm::device_uvector<cudf::size_type> offsets(
+      static_cast<size_t>(total) + 1, stream, mr);
+  thrust::exclusive_scan(
+      rmm::exec_policy(stream),
+      flags.begin(),
+      flags.end(),
+      offsets.begin(),
+      cudf::size_type{0});
+  cudf::size_type matchCount = 0;
+  {
+    cudf::size_type lastOffset = 0;
+    uint8_t lastFlag = 0;
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        &lastOffset,
+        offsets.data() + total - 1,
+        sizeof(cudf::size_type),
+        cudaMemcpyDeviceToHost,
+        stream.value()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        &lastFlag,
+        flags.data() + total - 1,
+        sizeof(uint8_t),
+        cudaMemcpyDeviceToHost,
+        stream.value()));
+    stream.synchronize();
+    matchCount = lastOffset + static_cast<cudf::size_type>(lastFlag);
+  }
+
+  auto probeIdx = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_to_id<cudf::size_type>()},
+      matchCount,
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      mr);
+  auto buildIdx = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_to_id<cudf::size_type>()},
+      matchCount,
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      mr);
+  if (matchCount == 0) {
+    return {std::move(probeIdx), std::move(buildIdx)};
+  }
+  auto* probeOut = probeIdx->mutable_view().data<cudf::size_type>();
+  auto* buildOut = buildIdx->mutable_view().data<cudf::size_type>();
+  auto* offsetsPtr = offsets.data();
+
+  thrust::for_each_n(
+      rmm::exec_policy(stream),
+      thrust::counting_iterator<int64_t>(0),
+      total,
+      [flagsPtr, offsetsPtr, numBuild, probeOut, buildOut] __device__(
+          int64_t idx) {
+        if (flagsPtr[idx] == 0) {
+          return;
+        }
+        auto const outPos = offsetsPtr[idx];
+        probeOut[outPos] = static_cast<cudf::size_type>(idx / numBuild);
+        buildOut[outPos] = static_cast<cudf::size_type>(idx % numBuild);
+      });
+
+  return {std::move(probeIdx), std::move(buildIdx)};
+}
+
+namespace {
+
+__device__ inline void clampCellRange(
+    double minV,
+    double maxV,
+    double origin,
+    double invCell,
+    int32_t nCells,
+    int32_t& c0,
+    int32_t& c1) {
+  c0 = static_cast<int32_t>(floor((minV - origin) * invCell));
+  c1 = static_cast<int32_t>(floor((maxV - origin) * invCell));
+  if (c0 < 0) {
+    c0 = 0;
+  }
+  if (c1 < 0) {
+    c1 = 0;
+  }
+  if (c0 >= nCells) {
+    c0 = nCells - 1;
+  }
+  if (c1 >= nCells) {
+    c1 = nCells - 1;
+  }
+  if (c1 < c0) {
+    int32_t tmp = c0;
+    c0 = c1;
+    c1 = tmp;
+  }
+}
+
+} // namespace
+
+GeometryEnvelopeGrid buildGeometryEnvelopeGrid(
+    GeometryEnvelopes buildEnvelopes,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  GeometryEnvelopeGrid grid;
+  grid.envelopes = std::move(buildEnvelopes);
+  auto const n = grid.envelopes.minX->size();
+  if (n == 0) {
+    grid.nCols = 1;
+    grid.nRows = 1;
+    grid.cellOffsets = cudf::make_numeric_column(
+        cudf::data_type{cudf::type_id::INT32},
+        2,
+        cudf::mask_state::UNALLOCATED,
+        stream,
+        mr);
+    auto* off = grid.cellOffsets->mutable_view().data<int32_t>();
+    thrust::fill_n(rmm::exec_policy(stream), off, 2, 0);
+    grid.cellBuildIndices = cudf::make_empty_column(
+        cudf::type_to_id<cudf::size_type>());
+    return grid;
+  }
+
+  auto minX = grid.envelopes.minX->view().data<double>();
+  auto minY = grid.envelopes.minY->view().data<double>();
+  auto maxX = grid.envelopes.maxX->view().data<double>();
+  auto maxY = grid.envelopes.maxY->view().data<double>();
+  auto nullMask = grid.envelopes.minX->view().null_mask();
+
+  constexpr double kPosInf = 1.0e300;
+  constexpr double kNegInf = -1.0e300;
+
+  double hMinX = thrust::transform_reduce(
+      rmm::exec_policy(stream),
+      thrust::counting_iterator<cudf::size_type>(0),
+      thrust::counting_iterator<cudf::size_type>(n),
+      [minX, nullMask] __device__(cudf::size_type i) -> double {
+        if (nullMask && !cudf::bit_is_set(nullMask, i)) {
+          return 1.0e300;
+        }
+        double const v = minX[i];
+        return isnan(v) ? 1.0e300 : v;
+      },
+      kPosInf,
+      thrust::minimum<double>());
+  double hMinY = thrust::transform_reduce(
+      rmm::exec_policy(stream),
+      thrust::counting_iterator<cudf::size_type>(0),
+      thrust::counting_iterator<cudf::size_type>(n),
+      [minY, nullMask] __device__(cudf::size_type i) -> double {
+        if (nullMask && !cudf::bit_is_set(nullMask, i)) {
+          return 1.0e300;
+        }
+        double const v = minY[i];
+        return isnan(v) ? 1.0e300 : v;
+      },
+      kPosInf,
+      thrust::minimum<double>());
+  double hMaxX = thrust::transform_reduce(
+      rmm::exec_policy(stream),
+      thrust::counting_iterator<cudf::size_type>(0),
+      thrust::counting_iterator<cudf::size_type>(n),
+      [maxX, nullMask] __device__(cudf::size_type i) -> double {
+        if (nullMask && !cudf::bit_is_set(nullMask, i)) {
+          return -1.0e300;
+        }
+        double const v = maxX[i];
+        return isnan(v) ? -1.0e300 : v;
+      },
+      kNegInf,
+      thrust::maximum<double>());
+  double hMaxY = thrust::transform_reduce(
+      rmm::exec_policy(stream),
+      thrust::counting_iterator<cudf::size_type>(0),
+      thrust::counting_iterator<cudf::size_type>(n),
+      [maxY, nullMask] __device__(cudf::size_type i) -> double {
+        if (nullMask && !cudf::bit_is_set(nullMask, i)) {
+          return -1.0e300;
+        }
+        double const v = maxY[i];
+        return isnan(v) ? -1.0e300 : v;
+      },
+      kNegInf,
+      thrust::maximum<double>());
+
+  if (!(hMinX <= hMaxX) || !(hMinY <= hMaxY)) {
+    grid.nCols = 1;
+    grid.nRows = 1;
+    grid.originX = 0;
+    grid.originY = 0;
+    grid.invCellW = 1;
+    grid.invCellH = 1;
+    grid.cellOffsets = cudf::make_numeric_column(
+        cudf::data_type{cudf::type_id::INT32},
+        2,
+        cudf::mask_state::UNALLOCATED,
+        stream,
+        mr);
+    auto* off = grid.cellOffsets->mutable_view().data<int32_t>();
+    thrust::fill_n(rmm::exec_policy(stream), off, 2, 0);
+    grid.cellBuildIndices = cudf::make_empty_column(
+        cudf::type_to_id<cudf::size_type>());
+    return grid;
+  }
+
+  // Pad slightly so boundary points map into cells.
+  double const padX = (hMaxX - hMinX) * 1e-6 + 1e-12;
+  double const padY = (hMaxY - hMinY) * 1e-6 + 1e-12;
+  hMinX -= padX;
+  hMaxX += padX;
+  hMinY -= padY;
+  hMaxY += padY;
+
+  int32_t side = static_cast<int32_t>(std::ceil(std::sqrt(static_cast<double>(n))));
+  side = std::max(16, std::min(side, 512));
+  grid.nCols = side;
+  grid.nRows = side;
+  grid.originX = hMinX;
+  grid.originY = hMinY;
+  double const cellW = (hMaxX - hMinX) / grid.nCols;
+  double const cellH = (hMaxY - hMinY) / grid.nRows;
+  grid.invCellW = 1.0 / cellW;
+  grid.invCellH = 1.0 / cellH;
+
+  auto const nCells = static_cast<int64_t>(grid.nCols) * grid.nRows;
+  rmm::device_uvector<int32_t> counts(static_cast<size_t>(nCells), stream, mr);
+  thrust::fill_n(
+      rmm::exec_policy(stream), counts.begin(), counts.size(), int32_t{0});
+
+  auto* countsPtr = counts.data();
+  int32_t const nCols = grid.nCols;
+  int32_t const nRows = grid.nRows;
+  double const originX = grid.originX;
+  double const originY = grid.originY;
+  double const invCellW = grid.invCellW;
+  double const invCellH = grid.invCellH;
+
+  thrust::for_each_n(
+      rmm::exec_policy(stream),
+      thrust::counting_iterator<cudf::size_type>(0),
+      n,
+      [minX,
+       minY,
+       maxX,
+       maxY,
+       nullMask,
+       countsPtr,
+       nCols,
+       nRows,
+       originX,
+       originY,
+       invCellW,
+       invCellH] __device__(cudf::size_type i) {
+        if (nullMask && !cudf::bit_is_set(nullMask, i)) {
+          return;
+        }
+        int32_t c0, c1, r0, r1;
+        clampCellRange(minX[i], maxX[i], originX, invCellW, nCols, c0, c1);
+        clampCellRange(minY[i], maxY[i], originY, invCellH, nRows, r0, r1);
+        for (int32_t r = r0; r <= r1; ++r) {
+          for (int32_t c = c0; c <= c1; ++c) {
+            atomicAdd(&countsPtr[static_cast<int64_t>(r) * nCols + c], 1);
+          }
+        }
+      });
+
+  grid.cellOffsets = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_id::INT32},
+      static_cast<cudf::size_type>(nCells + 1),
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      mr);
+  auto* offsetsPtr = grid.cellOffsets->mutable_view().data<int32_t>();
+  thrust::exclusive_scan(
+      rmm::exec_policy(stream),
+      counts.begin(),
+      counts.end(),
+      offsetsPtr,
+      int32_t{0});
+  int32_t totalEntries = 0;
+  {
+    int32_t lastCount = 0;
+    int32_t lastOffset = 0;
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        &lastCount,
+        counts.data() + nCells - 1,
+        sizeof(int32_t),
+        cudaMemcpyDeviceToHost,
+        stream.value()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        &lastOffset,
+        offsetsPtr + nCells - 1,
+        sizeof(int32_t),
+        cudaMemcpyDeviceToHost,
+        stream.value()));
+    stream.synchronize();
+    totalEntries = lastOffset + lastCount;
+  }
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      offsetsPtr + nCells,
+      &totalEntries,
+      sizeof(int32_t),
+      cudaMemcpyHostToDevice,
+      stream.value()));
+
+  grid.cellBuildIndices = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_to_id<cudf::size_type>()},
+      totalEntries,
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      mr);
+  if (totalEntries == 0) {
+    return grid;
+  }
+
+  // Reuse counts as per-cell insert cursors starting at offsets.
+  thrust::copy_n(
+      rmm::exec_policy(stream), offsetsPtr, nCells, counts.begin());
+  auto* insertPtr = counts.data();
+  auto* cellBuildPtr =
+      grid.cellBuildIndices->mutable_view().data<cudf::size_type>();
+
+  thrust::for_each_n(
+      rmm::exec_policy(stream),
+      thrust::counting_iterator<cudf::size_type>(0),
+      n,
+      [minX,
+       minY,
+       maxX,
+       maxY,
+       nullMask,
+       insertPtr,
+       cellBuildPtr,
+       nCols,
+       nRows,
+       originX,
+       originY,
+       invCellW,
+       invCellH] __device__(cudf::size_type i) {
+        if (nullMask && !cudf::bit_is_set(nullMask, i)) {
+          return;
+        }
+        int32_t c0, c1, r0, r1;
+        clampCellRange(minX[i], maxX[i], originX, invCellW, nCols, c0, c1);
+        clampCellRange(minY[i], maxY[i], originY, invCellH, nRows, r0, r1);
+        for (int32_t r = r0; r <= r1; ++r) {
+          for (int32_t c = c0; c <= c1; ++c) {
+            int32_t const pos = atomicAdd(
+                &insertPtr[static_cast<int64_t>(r) * nCols + c], 1);
+            cellBuildPtr[pos] = i;
+          }
+        }
+      });
+
+  return grid;
+}
+
+std::pair<std::unique_ptr<cudf::column>, std::unique_ptr<cudf::column>>
+queryGeometryEnvelopeGrid(
+    GeometryEnvelopeGrid const& grid,
+    GeometryEnvelopes const& probe,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  auto const numProbe = probe.minX->size();
+  if (numProbe == 0 || grid.cellBuildIndices->size() == 0) {
+    return {
+        cudf::make_empty_column(cudf::type_to_id<cudf::size_type>()),
+        cudf::make_empty_column(cudf::type_to_id<cudf::size_type>())};
+  }
+
+  auto pMinX = probe.minX->view().data<double>();
+  auto pMinY = probe.minY->view().data<double>();
+  auto pMaxX = probe.maxX->view().data<double>();
+  auto pMaxY = probe.maxY->view().data<double>();
+  auto pNull = probe.minX->view().null_mask();
+  auto bMinX = grid.envelopes.minX->view().data<double>();
+  auto bMinY = grid.envelopes.minY->view().data<double>();
+  auto bMaxX = grid.envelopes.maxX->view().data<double>();
+  auto bMaxY = grid.envelopes.maxY->view().data<double>();
+  auto bNull = grid.envelopes.minX->view().null_mask();
+  auto cellOffsets = grid.cellOffsets->view().data<int32_t>();
+  auto cellBuilds =
+      grid.cellBuildIndices->view().data<cudf::size_type>();
+  int32_t const nCols = grid.nCols;
+  int32_t const nRows = grid.nRows;
+  double const originX = grid.originX;
+  double const originY = grid.originY;
+  double const invCellW = grid.invCellW;
+  double const invCellH = grid.invCellH;
+
+  rmm::device_uvector<cudf::size_type> matchCounts(
+      static_cast<size_t>(numProbe), stream, mr);
+  auto* matchCountsPtr = matchCounts.data();
+
+  thrust::for_each_n(
+      rmm::exec_policy(stream),
+      thrust::counting_iterator<cudf::size_type>(0),
+      numProbe,
+      [pMinX,
+       pMinY,
+       pMaxX,
+       pMaxY,
+       pNull,
+       bMinX,
+       bMinY,
+       bMaxX,
+       bMaxY,
+       bNull,
+       cellOffsets,
+       cellBuilds,
+       nCols,
+       nRows,
+       originX,
+       originY,
+       invCellW,
+       invCellH,
+       matchCountsPtr] __device__(cudf::size_type pi) {
+        if (pNull && !cudf::bit_is_set(pNull, pi)) {
+          matchCountsPtr[pi] = 0;
+          return;
+        }
+        int32_t c0, c1, r0, r1;
+        clampCellRange(
+            pMinX[pi], pMaxX[pi], originX, invCellW, nCols, c0, c1);
+        clampCellRange(
+            pMinY[pi], pMaxY[pi], originY, invCellH, nRows, r0, r1);
+        cudf::size_type count = 0;
+        for (int32_t r = r0; r <= r1; ++r) {
+          for (int32_t c = c0; c <= c1; ++c) {
+            int64_t const cell = static_cast<int64_t>(r) * nCols + c;
+            int32_t const begin = cellOffsets[cell];
+            int32_t const end = cellOffsets[cell + 1];
+            for (int32_t k = begin; k < end; ++k) {
+              auto const bj = cellBuilds[k];
+              if (bNull && !cudf::bit_is_set(bNull, bj)) {
+                continue;
+              }
+              if (envelopesIntersect(
+                      pMinX[pi],
+                      pMinY[pi],
+                      pMaxX[pi],
+                      pMaxY[pi],
+                      bMinX[bj],
+                      bMinY[bj],
+                      bMaxX[bj],
+                      bMaxY[bj])) {
+                ++count;
+              }
+            }
+          }
+        }
+        matchCountsPtr[pi] = count;
+      });
+
+  rmm::device_uvector<cudf::size_type> probeOffsets(
+      static_cast<size_t>(numProbe) + 1, stream, mr);
+  thrust::exclusive_scan(
+      rmm::exec_policy(stream),
+      matchCounts.begin(),
+      matchCounts.end(),
+      probeOffsets.begin(),
+      cudf::size_type{0});
+  cudf::size_type totalMatches = 0;
+  {
+    cudf::size_type lastCount = 0;
+    cudf::size_type lastOffset = 0;
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        &lastCount,
+        matchCounts.data() + numProbe - 1,
+        sizeof(cudf::size_type),
+        cudaMemcpyDeviceToHost,
+        stream.value()));
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+        &lastOffset,
+        probeOffsets.data() + numProbe - 1,
+        sizeof(cudf::size_type),
+        cudaMemcpyDeviceToHost,
+        stream.value()));
+    stream.synchronize();
+    totalMatches = lastOffset + lastCount;
+  }
+
+  auto probeIdx = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_to_id<cudf::size_type>()},
+      totalMatches,
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      mr);
+  auto buildIdx = cudf::make_numeric_column(
+      cudf::data_type{cudf::type_to_id<cudf::size_type>()},
+      totalMatches,
+      cudf::mask_state::UNALLOCATED,
+      stream,
+      mr);
+  if (totalMatches == 0) {
+    return {std::move(probeIdx), std::move(buildIdx)};
+  }
+
+  auto* probeOut = probeIdx->mutable_view().data<cudf::size_type>();
+  auto* buildOut = buildIdx->mutable_view().data<cudf::size_type>();
+  auto* probeOffsetsPtr = probeOffsets.data();
+
+  thrust::for_each_n(
+      rmm::exec_policy(stream),
+      thrust::counting_iterator<cudf::size_type>(0),
+      numProbe,
+      [pMinX,
+       pMinY,
+       pMaxX,
+       pMaxY,
+       pNull,
+       bMinX,
+       bMinY,
+       bMaxX,
+       bMaxY,
+       bNull,
+       cellOffsets,
+       cellBuilds,
+       nCols,
+       nRows,
+       originX,
+       originY,
+       invCellW,
+       invCellH,
+       probeOffsetsPtr,
+       probeOut,
+       buildOut] __device__(cudf::size_type pi) {
+        if (pNull && !cudf::bit_is_set(pNull, pi)) {
+          return;
+        }
+        int32_t c0, c1, r0, r1;
+        clampCellRange(
+            pMinX[pi], pMaxX[pi], originX, invCellW, nCols, c0, c1);
+        clampCellRange(
+            pMinY[pi], pMaxY[pi], originY, invCellH, nRows, r0, r1);
+        cudf::size_type outPos = probeOffsetsPtr[pi];
+        for (int32_t r = r0; r <= r1; ++r) {
+          for (int32_t c = c0; c <= c1; ++c) {
+            int64_t const cell = static_cast<int64_t>(r) * nCols + c;
+            int32_t const begin = cellOffsets[cell];
+            int32_t const end = cellOffsets[cell + 1];
+            for (int32_t k = begin; k < end; ++k) {
+              auto const bj = cellBuilds[k];
+              if (bNull && !cudf::bit_is_set(bNull, bj)) {
+                continue;
+              }
+              if (envelopesIntersect(
+                      pMinX[pi],
+                      pMinY[pi],
+                      pMaxX[pi],
+                      pMaxY[pi],
+                      bMinX[bj],
+                      bMinY[bj],
+                      bMaxX[bj],
+                      bMaxY[bj])) {
+                probeOut[outPos] = pi;
+                buildOut[outPos] = bj;
+                ++outPos;
+              }
+            }
+          }
+        }
+      });
+
+  // A build row may sit in multiple cells; collapse duplicate pairs.
+  if (totalMatches > 1) {
+    auto zipIn = thrust::make_zip_iterator(
+        thrust::make_tuple(probeOut, buildOut));
+    thrust::sort(rmm::exec_policy(stream), zipIn, zipIn + totalMatches);
+    auto zipEnd = thrust::unique(
+        rmm::exec_policy(stream), zipIn, zipIn + totalMatches);
+    auto uniqueCount = static_cast<cudf::size_type>(
+        thrust::distance(zipIn, zipEnd));
+    if (uniqueCount < totalMatches) {
+      auto probeUnique = cudf::make_numeric_column(
+          cudf::data_type{cudf::type_to_id<cudf::size_type>()},
+          uniqueCount,
+          cudf::mask_state::UNALLOCATED,
+          stream,
+          mr);
+      auto buildUnique = cudf::make_numeric_column(
+          cudf::data_type{cudf::type_to_id<cudf::size_type>()},
+          uniqueCount,
+          cudf::mask_state::UNALLOCATED,
+          stream,
+          mr);
+      thrust::copy_n(
+          rmm::exec_policy(stream),
+          probeOut,
+          uniqueCount,
+          probeUnique->mutable_view().data<cudf::size_type>());
+      thrust::copy_n(
+          rmm::exec_policy(stream),
+          buildOut,
+          uniqueCount,
+          buildUnique->mutable_view().data<cudf::size_type>());
+      return {std::move(probeUnique), std::move(buildUnique)};
+    }
+  }
+
+  return {std::move(probeIdx), std::move(buildIdx)};
 }
 
 } // namespace facebook::velox::cudf_velox

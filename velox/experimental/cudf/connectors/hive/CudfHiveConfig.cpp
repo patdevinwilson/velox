@@ -93,6 +93,17 @@ bool CudfHiveConfig::isAllowMismatchedCudfHiveSchemasSession(
       config_->get<bool>(kAllowMismatchedCudfHiveSchemas, false));
 }
 
+bool CudfHiveConfig::isCaseSensitiveNames() const {
+  // Default false: Hive column names are case-insensitive.
+  return config_->get<bool>(kCaseSensitiveNames, false);
+}
+
+bool CudfHiveConfig::isCaseSensitiveNamesSession(
+    const config::ConfigBase* session) const {
+  return session->get<bool>(
+      kCaseSensitiveNamesSession, config_->get<bool>(kCaseSensitiveNames, false));
+}
+
 cudf::data_type CudfHiveConfig::timestampType() const {
   const auto unit = config_->get<cudf::type_id>(
       kTimestampType, cudf::type_id::TIMESTAMP_MILLISECONDS /*milli*/);

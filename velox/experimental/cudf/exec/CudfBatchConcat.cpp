@@ -27,10 +27,11 @@ namespace {
 
 RowTypePtr getConcatOutputType(
     const std::shared_ptr<const core::PlanNode>& planNode) {
-  VELOX_CHECK_EQ(
+  // Aggregation: single source. Hash/NL join probe: sources()[0] is probe.
+  VELOX_CHECK_GE(
       planNode->sources().size(),
       1,
-      "CudfBatchConcat expects a single-source plan node");
+      "CudfBatchConcat expects a plan node with at least one source");
   return planNode->sources()[0]->outputType();
 }
 

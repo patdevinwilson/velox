@@ -512,6 +512,72 @@ TEST_F(TableScanTest, filterPushdown) {
 #endif
 }
 
+// Hive planners lower-case identifiers, while writers (e.g. pandas) often keep
+// mixed-case Parquet names with spaces/hyphens. cuDF must match
+// case-insensitively or stats filters built against the Velox schema see
+// out-of-range column indexes.
+TEST_F(TableScanTest, mixedCaseParquetNamesWithFilter) {
+  // File schema uses writer case; Hive/Velox schema is lower-case.
+  auto fileRowType = ROW(
+      {"Date received", "Sub-product", "Client_ID"},
+      {VARCHAR(), VARCHAR(), VARCHAR()});
+  auto hiveRowType = ROW(
+      {"date received", "sub-product", "client_id"},
+      {VARCHAR(), VARCHAR(), VARCHAR()});
+
+  auto vector = makeRowVector(
+      fileRowType->names(),
+      {
+          makeFlatVector<std::string>(std::vector<std::string>{
+              "2014-07-03", "2014-07-04", "2014-07-03"}),
+          makeFlatVector<std::string>(
+              std::vector<std::string>{"mortgage", "credit", "debt"}),
+          makeFlatVector<std::string>(std::vector<std::string>{"A", "B", "C"}),
+      });
+
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->getPath(), vector);
+
+  common::SubfieldFilters subfieldFilters =
+      common::test::SubfieldFiltersBuilder()
+          .add(
+              "date received",
+              std::make_unique<common::BytesValues>(
+                  std::vector<std::string>{"2014-07-03"},
+                  /*nullAllowed*/ false))
+          .build();
+
+  auto tableHandle = makeTableHandle(
+      "parquet_table", hiveRowType, std::move(subfieldFilters), nullptr);
+
+  // Project client_id + sub-product; filter-only on date received.
+  connector::ColumnHandleMap assignments;
+  assignments["client_id"] = makeColumnHandle("client_id", VARCHAR());
+  assignments["sub-product"] = makeColumnHandle("sub-product", VARCHAR());
+
+  auto expected = makeRowVector(
+      {"client_id", "sub-product"},
+      {
+          makeFlatVector<std::string>(std::vector<std::string>{"A", "C"}),
+          makeFlatVector<std::string>(
+              std::vector<std::string>{"mortgage", "debt"}),
+      });
+
+  auto plan = PlanBuilder(pool_.get())
+                  .startTableScan()
+                  .connectorId(kCudfHiveConnectorId)
+                  .outputType(
+                      ROW({"client_id", "sub-product"}, {VARCHAR(), VARCHAR()}))
+                  .tableHandle(tableHandle)
+                  .assignments(assignments)
+                  .endTableScan()
+                  .planNode();
+
+  AssertQueryBuilder(plan)
+      .split(makeCudfHiveSplit(filePath->getPath()))
+      .assertResults(expected);
+}
+
 // Disable this test and the one below for now, pending a CUDF fix.
 // simoneves 2/25/26
 // @TODO simoneves/mattgara re-enable once fixed.

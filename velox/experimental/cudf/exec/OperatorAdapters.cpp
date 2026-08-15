@@ -63,6 +63,8 @@
 #include "velox/exec/Values.h"
 #include "velox/exec/Window.h"
 
+#include <cctype>
+
 namespace facebook::velox::cudf_velox {
 
 /// OperatorAdapterRegistry Implementation
@@ -549,10 +551,17 @@ class NestedLoopJoinProbeAdapter : public CudfNestedLoopJoinBaseAdapter {
     auto joinPlanNode =
         std::dynamic_pointer_cast<const core::NestedLoopJoinNode>(planNode);
 
+    std::optional<SpatialEnvelopePrune> prune;
+    if (joinPlanNode->joinCondition()) {
+      prune = trySpatialEnvelopePruneFromFilter(
+          joinPlanNode->joinCondition(),
+          joinPlanNode->sources()[0]->outputType(),
+          joinPlanNode->sources()[1]->outputType());
+    }
+
     std::vector<std::unique_ptr<exec::Operator>> result;
-    result.push_back(
-        std::make_unique<CudfNestedLoopJoinProbe>(
-            operatorId, ctx, joinPlanNode));
+    result.push_back(std::make_unique<CudfNestedLoopJoinProbe>(
+        operatorId, ctx, joinPlanNode, std::move(prune)));
     return result;
   }
 };
@@ -667,6 +676,49 @@ class SpatialJoinProbeAdapter : public CudfSpatialJoinBaseAdapter {
     prune.buildGeometryName = spatialJoin->buildGeometry()->name();
     if (spatialJoin->radius().has_value()) {
       prune.buildRadiusName = spatialJoin->radius().value()->name();
+      prune.predicate = SpatialPrunePredicate::kDistanceLE;
+    } else if (spatialJoin->joinCondition()) {
+      auto detected = trySpatialEnvelopePruneFromFilter(
+          spatialJoin->joinCondition(),
+          spatialJoin->sources()[0]->outputType(),
+          spatialJoin->sources()[1]->outputType());
+      if (detected.has_value()) {
+        prune.predicate = detected->predicate;
+        prune.withinPointOnBuild = detected->withinPointOnBuild;
+        prune.probeIsWkb = detected->probeIsWkb;
+        prune.buildIsWkb = detected->buildIsWkb;
+        prune.filterIsCompound = detected->filterIsCompound;
+        prune.residualFilter = detected->residualFilter;
+        prune.buildConstantAabb = detected->buildConstantAabb;
+        prune.knnK = detected->knnK;
+        prune.knnUseSpheroid = detected->knnUseSpheroid;
+        // Prefer detected geometry names when they differ (exclusive side
+        // binding). When both Within args share one FieldAccess name
+        // ("st_geomfrombinary" on each side), keep SpatialJoin's per-side
+        // names so getChildIdx resolves correctly on each RowType.
+        if (detected->probeGeometryName != detected->buildGeometryName) {
+          prune.probeGeometryName = detected->probeGeometryName;
+          prune.buildGeometryName = detected->buildGeometryName;
+        }
+      } else {
+        // Name collision on FieldAccess often makes detection fail. Still
+        // honor ST_Within so the point-probe path + runtime tag sampling run.
+        auto call = std::dynamic_pointer_cast<const core::CallTypedExpr>(
+            spatialJoin->joinCondition());
+        auto isWithin = false;
+        if (call) {
+          auto name = call->name();
+          for (auto& c : name) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+          }
+          isWithin = name.size() >= 9 &&
+              name.compare(name.size() - 9, 9, "st_within") == 0;
+        }
+        prune.predicate = isWithin ? SpatialPrunePredicate::kWithin
+                                   : SpatialPrunePredicate::kIntersects;
+      }
+    } else {
+      prune.predicate = SpatialPrunePredicate::kIntersects;
     }
 
     std::vector<std::unique_ptr<exec::Operator>> result;

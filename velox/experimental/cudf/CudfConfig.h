@@ -30,6 +30,8 @@ struct CudfConfig {
   static constexpr const char* kCudfDebugEnabled{"cudf.debug_enabled"};
   static constexpr const char* kCudfMemoryResource{"cudf.memory_resource"};
   static constexpr const char* kCudfMemoryPercent{"cudf.memory_percent"};
+  static constexpr const char* kCudfMemoryMaxPercent{
+      "cudf.memory_max_percent"};
   static constexpr const char* kCudfFunctionNamePrefix{
       "cudf.function_name_prefix"};
   static constexpr const char* kCudfAstExpressionEnabled{
@@ -77,6 +79,12 @@ struct CudfConfig {
   /// The initial percent of GPU memory to allocate for pool or arena memory
   /// resources.
   int32_t memoryPercent{50};
+
+  /// Upper bound on managed-memory pool growth, as a percent of total device
+  /// memory. Managed pools spill to host RAM, so leaving this unbounded lets
+  /// co-located workers exhaust the host. Values above 100 oversubscribe
+  /// deliberately; 0 disables the cap.
+  int32_t memoryMaxPercent{150};
 
   /// Memory resource for output vectors. When set to a value different from
   /// memoryResource, a separate MR is created for output allocations.

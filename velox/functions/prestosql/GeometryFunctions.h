@@ -367,6 +367,32 @@ struct StIntersectsFunction {
   }
 };
 
+/// ST_KNN is a join predicate stub (Sedona semantics). Row-wise evaluation is
+/// unsupported; the GPU NestedLoopJoin path implements k-NN.
+template <typename T>
+struct StKnnFunction {
+  VELOX_DEFINE_FUNCTION_TYPES(T);
+
+  FOLLY_ALWAYS_INLINE Status call(
+      out_type<bool>& /*result*/,
+      const arg_type<Geometry>& /*left*/,
+      const arg_type<Geometry>& /*right*/,
+      const arg_type<int32_t>& /*k*/,
+      const arg_type<bool>& /*useSpheroid*/) {
+    return Status::UserError(
+        "ST_KNN is only supported as a native GPU join predicate");
+  }
+
+  FOLLY_ALWAYS_INLINE Status call(
+      out_type<bool>& /*result*/,
+      const arg_type<Geometry>& /*left*/,
+      const arg_type<Geometry>& /*right*/,
+      const arg_type<int32_t>& /*k*/) {
+    return Status::UserError(
+        "ST_KNN is only supported as a native GPU join predicate");
+  }
+};
+
 template <typename T>
 struct StOverlapsFunction {
   VELOX_DEFINE_FUNCTION_TYPES(T);

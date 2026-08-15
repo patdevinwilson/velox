@@ -176,7 +176,10 @@ void CudfEqualityDeleteFileReader::directReadEqualityDeleteFile(
 
   // Read the equality delete file
   auto options =
-      cudf::io::parquet_reader_options::builder(std::move(sourceInfo)).build();
+      cudf::io::parquet_reader_options::builder(std::move(sourceInfo))
+          // Match CudfSplitReader: Hive identifiers are case-insensitive.
+          .case_sensitive_names(false)
+          .build();
   options.set_column_names(equalityColumnNames_);
   auto stream = cudfGlobalStreamPool().get_stream();
   deleteKeyTable_ =

@@ -190,8 +190,31 @@ void setArrowFormatBackToVarbinary(ArrowSchema* schema, const TypePtr& type) {
       }
       break;
     }
+    case TypeKind::ARRAY: {
+      // Arrow list schemas have a single child (the element/values array).
+      // Remap ARRAY(VARBINARY)/ARRAY(GEOMETRY) elements that cuDF exported as
+      // STRING — required for SpatialBench Q5 ARRAY_AGG(geometry).
+      if (schema->n_children >= 1) {
+        setArrowFormatBackToVarbinary(
+            schema->children[schema->n_children - 1], type->childAt(0));
+      }
+      break;
+    }
+    case TypeKind::MAP: {
+      // Arrow map: typically struct child with key/value, or 2 children.
+      if (schema->n_children >= 2) {
+        setArrowFormatBackToVarbinary(schema->children[0], type->childAt(0));
+        setArrowFormatBackToVarbinary(schema->children[1], type->childAt(1));
+      } else if (schema->n_children == 1 && schema->children[0]->n_children >= 2) {
+        auto* entries = schema->children[0];
+        setArrowFormatBackToVarbinary(entries->children[0], type->childAt(0));
+        setArrowFormatBackToVarbinary(entries->children[1], type->childAt(1));
+      }
+      break;
+    }
     case TypeKind::VARBINARY: {
       // Replace any format string with "z" to indicate VARBINARY.
+      // Also covers GEOMETRY (VarbinaryType subclass).
       static constexpr const char* kVarbinaryArrowFormat = "z";
       if (schema->format != nullptr) {
         std::free(const_cast<char*>(schema->format));

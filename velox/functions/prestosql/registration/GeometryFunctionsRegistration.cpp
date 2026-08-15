@@ -78,6 +78,10 @@ void registerRelationPredicates(const std::string& prefix) {
       {{prefix + "ST_Equals"}});
   registerFunction<StIntersectsFunction, bool, Geometry, Geometry>(
       {{prefix + "ST_Intersects"}});
+  registerFunction<StKnnFunction, bool, Geometry, Geometry, int32_t, bool>(
+      {{prefix + "ST_KNN"}});
+  registerFunction<StKnnFunction, bool, Geometry, Geometry, int32_t>(
+      {{prefix + "ST_KNN"}});
   registerFunction<StOverlapsFunction, bool, Geometry, Geometry>(
       {{prefix + "ST_Overlaps"}});
   registerFunction<StTouchesFunction, bool, Geometry, Geometry>(

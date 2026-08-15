@@ -333,6 +333,8 @@ void CudfSplitReader::setupReaderOptions() {
           .use_arrow_schema(cudfHiveConfig_->isUseArrowSchema())
           .allow_mismatched_pq_schemas(
               cudfHiveConfig_->isAllowMismatchedCudfHiveSchemas())
+          .case_sensitive_names(cudfHiveConfig_->isCaseSensitiveNamesSession(
+              connectorQueryCtx_->sessionProperties()))
           .timestamp_type(cudfHiveConfig_->timestampType())
           .build();
 

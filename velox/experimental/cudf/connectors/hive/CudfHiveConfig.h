@@ -69,6 +69,18 @@ class CudfHiveConfig {
   static constexpr const char* kAllowMismatchedCudfHiveSchemasSession =
       "parquet.reader.allow_mismatched_parquet_schemas";
 
+  // Whether Parquet column name matching is case-sensitive. Hive identifiers are
+  // case-insensitive and planners typically lower-case column/filter names, while
+  // Parquet files often preserve writer case (e.g. pandas). Default false so
+  // "date received" matches file column "Date received". When true, unmatched
+  // names are dropped (cuDF ignore_missing_columns) and stats-filter ASTs built
+  // against the Velox schema can hit "Column index cannot be more than number of
+  // columns in the table".
+  static constexpr const char* kCaseSensitiveNames =
+      "parquet.reader.case-sensitive-names";
+  static constexpr const char* kCaseSensitiveNamesSession =
+      "parquet.reader.case_sensitive_names";
+
   // Cast timestamp columns to a specific type
   static constexpr const char* kTimestampType = "parquet.reader.timestamp-type";
   static constexpr const char* kTimestampTypeSession =
@@ -148,6 +160,9 @@ class CudfHiveConfig {
   bool isAllowMismatchedCudfHiveSchemas() const;
   bool isAllowMismatchedCudfHiveSchemasSession(
       const config::ConfigBase* session) const;
+
+  bool isCaseSensitiveNames() const;
+  bool isCaseSensitiveNamesSession(const config::ConfigBase* session) const;
 
   cudf::data_type timestampType() const;
   cudf::data_type timestampTypeSession(const config::ConfigBase* session) const;

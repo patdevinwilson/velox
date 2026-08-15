@@ -34,15 +34,33 @@ extern std::optional<cuda::mr::any_resource<cuda::mr::device_accessible>>
 /// Returns the memory resource designated for output vector allocations.
 rmm::device_async_resource_ref get_output_mr();
 
+/// Names the operation allocating on this thread so the big-allocation tracer
+/// can attribute an outsized request to a call site. Symbolized stack traces
+/// are ambiguous under inlining; a label is not.
+class AllocLabelGuard {
+ public:
+  explicit AllocLabelGuard(char const* label);
+  ~AllocLabelGuard();
+
+  AllocLabelGuard(AllocLabelGuard const&) = delete;
+  AllocLabelGuard& operator=(AllocLabelGuard const&) = delete;
+
+ private:
+  char const* previous_;
+};
+
 /**
  * @brief Creates a memory resource based on the given mode.
  *
  * @param mode rmm::mr::pool_memory_resource mode.
  * @param percent The initial percent of GPU memory to allocate for memory
  * resource.
+ * @param maxPercent Upper bound on managed pool growth, as a percent of total
+ * device memory; values above 100 oversubscribe into host RAM. Ignored by
+ * modes whose pool cannot outgrow the device. 0 means unbounded.
  */
 [[nodiscard]] cuda::mr::any_resource<cuda::mr::device_accessible>
-createMemoryResource(std::string_view mode, int percent);
+createMemoryResource(std::string_view mode, int percent, int maxPercent = 0);
 
 /**
  * @brief Returns the global CUDA stream pool used by cudf.

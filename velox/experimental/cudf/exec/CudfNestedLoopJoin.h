@@ -32,22 +32,64 @@
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <array>
 
 namespace facebook::velox::cudf_velox {
 
 class CudaEvent;
 
-/// Optional envelope pruning metadata for SpatialJoin → NLJ. Probe envelopes
-/// are unexpanded; build envelopes are expanded by the per-row radius column
-/// (CPU SpatialJoinBuild semantics) before intersection tests.
+/// Optional envelope pruning metadata for SpatialJoin / NestedLoopJoin.
+/// Probe envelopes are unexpanded; build envelopes are expanded by the
+/// per-row radius column (CPU SpatialJoinBuild semantics) before intersection
+/// tests when predicate is DistanceLE.
+enum class SpatialPrunePredicate {
+  kDistanceLE, // ST_Distance(probe, build) <= radius
+  kWithin, // ST_Within(probePoint, buildPoly) or swapped field order
+  kIntersects, // ST_Intersects(probe, build)
+  kKnn, // ST_KNN(probe, build, k, useSpheroid) — emit k nearest builds
+};
+
 struct SpatialEnvelopePrune {
   std::string probeGeometryName;
   std::string buildGeometryName;
   std::optional<std::string> buildRadiusName;
+  SpatialPrunePredicate predicate{SpatialPrunePredicate::kDistanceLE};
+  /// When true, ST_Within args are (build, probe) i.e. point is on build side.
+  bool withinPointOnBuild{false};
+  /// Field is WKB (ST_GeomFromBinary wrapper); convert before geometry kernels.
+  bool probeIsWkb{false};
+  bool buildIsWkb{false};
+  /// Join filter is AND/OR of multiple conjuncts (e.g. Q6). Envelope prune
+  /// may use a single spatial conjunct (prefer Within); specialized geometry
+  /// kernels must be refined with the full filterEvaluator_ result.
+  bool filterIsCompound{false};
+  /// The conjuncts other than the spatial one, ANDed together. Set only when
+  /// the spatial conjunct is a Within that the indexed point-in-polygon kernel
+  /// evaluates exactly, so refinement can skip re-testing it and evaluate just
+  /// these instead. Null means refinement must apply the whole filter.
+  core::TypedExprPtr residualFilter;
+  /// Optional constant AABB [minX, minY, maxX, maxY] that build envelopes
+  /// must intersect (Q6: ST_Intersects(constant_bbox, zone)). Applied when
+  /// building the build-side envelope grid.
+  std::optional<std::array<double, 4>> buildConstantAabb;
+  /// ST_KNN k (neighbors per probe). Valid when predicate == kKnn.
+  int32_t knnK{5};
+  /// ST_KNN use_spheroid; only Euclidean (false) is implemented on GPU.
+  bool knnUseSpheroid{false};
 };
+
+/// Best-effort parse of ST_Within / ST_Intersects join filters into envelope
+/// prune metadata. Returns nullopt when the filter is not a recognized
+/// spatial predicate over one probe field and one build field.
+std::optional<SpatialEnvelopePrune> trySpatialEnvelopePruneFromFilter(
+    const core::TypedExprPtr& filter,
+    const RowTypePtr& probeType,
+    const RowTypePtr& buildType);
 
 /// Coordinates data transfer from build to probe operators for nested loop
 /// join. Build operators accumulate batches, then one operator transfers them
@@ -71,9 +113,30 @@ class CudfNestedLoopJoinBridge : public exec::JoinBridge {
 
   std::optional<rmm::cuda_stream_view> getBuildStream();
 
+  /// Read-only spatial index derived from the build side: the build geometry
+  /// converted to Velox blobs, its envelope grid, and the per-part envelope
+  /// decomposition.
+  struct SpatialIndex {
+    std::unique_ptr<cudf::column> buildGeomVelox;
+    GeometryEnvelopeGrid envelopeGrid;
+    bool buildIsPolygonIndex{false};
+    GeometryEnvelopes partEnvelopes;
+    std::unique_ptr<cudf::column> partToRow;
+  };
+  using spatial_index_type = std::shared_ptr<const SpatialIndex>;
+
+  /// Returns the index shared by every probe driver on this worker, invoking
+  /// `factory` exactly once. Converting the broadcast build's WKB to Velox
+  /// geometry costs ~14GB for SF100 zones, so materialising it per driver (one
+  /// per pipeline thread) exhausts the device pool before the join can start.
+  spatial_index_type spatialIndex(
+      const std::function<std::unique_ptr<SpatialIndex>()>& factory);
+
  private:
   std::optional<build_data_type> data_;
   std::optional<rmm::cuda_stream_view> buildStream_;
+  std::mutex spatialIndexMutex_;
+  spatial_index_type spatialIndex_;
 };
 
 /// Accumulates build-side input for nested loop join.
@@ -193,18 +256,34 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   void doClose() override;
 
  private:
+  // cuDF tables with zero columns cannot encode a row count. When
+  // outputType_ is empty (e.g. COUNT(*) over SpatialJoin), callers must use
+  // numRows rather than table->num_rows().
+  struct JoinOutput {
+    std::unique_ptr<cudf::table> table;
+    vector_size_t numRows{0};
+  };
+
   /// Joins a single probe batch against the build table. Uses cross_join for
   /// unfiltered joins and conditional_inner_join for filtered joins. Updates
   /// probeMatchedFlags_ for left/full joins and buildMatchedFlags_ for
   /// right/full joins.
-  std::unique_ptr<cudf::table> joinWithBuildBatch(
+  /// The spatial (non-AST) filtered path can produce more matched pairs than
+  /// fit in one cudf column / output batch (nested zones ⨝ 600M trips at
+  /// SF100). It therefore processes probe rows starting at `probeRowBegin`,
+  /// stops once the accumulated output reaches an internal budget, and writes
+  /// the next unprocessed probe row to `*probeRowsConsumed`. Callers resume
+  /// from there. Defaults process the whole probe input in one shot.
+  JoinOutput joinWithBuildBatch(
       cudf::table_view probeTableView,
       cudf::table_view buildView,
-      rmm::cuda_stream_view stream);
+      rmm::cuda_stream_view stream,
+      cudf::size_type probeRowBegin = 0,
+      cudf::size_type* probeRowsConsumed = nullptr);
 
   /// Emits probe rows that had no match across all build batches, with null
   /// build columns. Used for left/full joins after all build batches exhausted.
-  std::unique_ptr<cudf::table> emitProbeMismatchRows(
+  JoinOutput emitProbeMismatchRows(
       cudf::table_view probeTableView,
       rmm::cuda_stream_view stream);
 
@@ -228,7 +307,9 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
       cudf::table_view probeTableView,
       cudf::table_view buildView,
       rmm::cuda_stream_view stream,
-      bool needBuildIndices = true);
+      bool needBuildIndices = true,
+      cudf::size_type probeRowBegin = 0,
+      cudf::size_type* probeRowsConsumed = nullptr);
 
   bool isLeftOrFullJoin() const {
     return joinType_ == core::JoinType::kLeft ||
@@ -261,6 +342,16 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   bool useAstFilter_{true};
   std::shared_ptr<CudfExpression> filterEvaluator_;
 
+  // Evaluates only the non-spatial conjuncts, letting the exact indexed
+  // point-in-polygon result stand for the spatial one. Refining with this
+  // avoids materializing geometry blobs per candidate pair.
+  std::shared_ptr<CudfExpression> residualEvaluator_;
+
+  // Indexed by combined (probe then build) column position: true when the
+  // residual never reads that column, so a wide one can be replaced by an
+  // empty placeholder rather than gathered.
+  std::vector<bool> residualUnreadColumn_;
+
   // Output column mapping resolved by name from the output type.
   // Handles arbitrary column ordering (e.g., {"b0", "p0"}).
   std::vector<cudf::size_type> probeColumnIndicesToGather_;
@@ -279,6 +370,12 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   // joinWithBuildBatch against the concatenated build table (single batch);
   // reset between probe inputs.
   std::unique_ptr<cudf::column> probeMatchedFlags_;
+
+  // Next probe row to process for the spatial filtered path, which streams a
+  // single probe input across multiple getOutput() calls when its match set is
+  // too large for one column/batch. Reset to 0 when a probe input is fully
+  // consumed. Zero for the single-shot (AST / small) paths.
+  cudf::size_type spatialProbeCursor_{0};
 
   // True when build side has no rows.
   bool buildEmpty_{false};
@@ -317,18 +414,29 @@ class CudfNestedLoopJoinProbe : public CudfOperatorBase {
   // envelopes; ST_Distance runs only on AABB candidates.
   void ensureSpatialIndex(rmm::cuda_stream_view stream);
 
+  /// Constructs the build-side index. Invoked once per worker through the
+  /// bridge; see CudfNestedLoopJoinBridge::spatialIndex.
+  std::unique_ptr<CudfNestedLoopJoinBridge::SpatialIndex> buildSpatialIndex(
+      rmm::cuda_stream_view stream);
+
   std::pair<std::unique_ptr<cudf::column>, std::unique_ptr<cudf::column>>
   spatialPruneConditionalIndices(
       cudf::table_view probeTableView,
       cudf::table_view buildView,
       rmm::cuda_stream_view stream,
-      bool needBuildIndices);
+      bool needBuildIndices,
+      cudf::size_type probeRowBegin = 0,
+      cudf::size_type* probeRowsConsumed = nullptr);
 
   std::optional<SpatialEnvelopePrune> spatialPrune_;
   cudf::size_type probeGeomChannel_{0};
   cudf::size_type buildGeomChannel_{0};
   std::optional<cudf::size_type> buildRadiusChannel_;
-  std::optional<GeometryEnvelopeGrid> buildEnvelopeGrid_;
+  // Build-side index (converted geometry, envelope grid, and the per-ring
+  // envelope decomposition that defeats antimeridian/island multipolygon skew).
+  // Owned by the bridge and shared by every probe driver on this worker: a
+  // per-driver copy of the converted build geometry is ~14GB at SF100.
+  CudfNestedLoopJoinBridge::spatial_index_type spatialIndex_;
 };
 
 /// Creates CUDF nested loop join operators and bridges.

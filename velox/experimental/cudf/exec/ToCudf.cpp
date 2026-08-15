@@ -317,14 +317,18 @@ void registerCudf() {
 
   const std::string mrMode = CudfConfig::getInstance().memoryResource;
   auto mr = cudf_velox::createMemoryResource(
-      mrMode, CudfConfig::getInstance().memoryPercent);
+      mrMode,
+      CudfConfig::getInstance().memoryPercent,
+      CudfConfig::getInstance().memoryMaxPercent);
   cudf::set_current_device_resource(mr);
   mr_ = std::move(mr);
 
   const auto& outputMrMode = CudfConfig::getInstance().outputMemoryResource;
   if (!outputMrMode.empty() && outputMrMode != mrMode) {
     output_mr_ = cudf_velox::createMemoryResource(
-        outputMrMode, CudfConfig::getInstance().memoryPercent);
+        outputMrMode,
+        CudfConfig::getInstance().memoryPercent,
+        CudfConfig::getInstance().memoryMaxPercent);
   } else {
     output_mr_ = mr_;
   }
@@ -381,6 +385,9 @@ void CudfConfig::initialize(
   }
   if (config.find(kCudfMemoryPercent) != config.end()) {
     memoryPercent = folly::to<int32_t>(config[kCudfMemoryPercent]);
+  }
+  if (config.find(kCudfMemoryMaxPercent) != config.end()) {
+    memoryMaxPercent = folly::to<int32_t>(config[kCudfMemoryMaxPercent]);
   }
   if (config.find(kCudfOutputMr) != config.end()) {
     outputMemoryResource = config[kCudfOutputMr];

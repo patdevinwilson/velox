@@ -95,11 +95,20 @@ CudfHiveDataSource::CudfHiveDataSource(
           subfieldFilters_,
           sampleRate);
 
-  // Add fields in the filter to the columns to read if not there
+  // Add fields in the filter to the columns to read if not there.
+  // Use NestedField::name() (same as SubfieldFiltersToAst / CPU getColumnName)
+  // rather than Subfield::toString(), which can differ for nested paths.
   for (const auto& [field, _] : subfieldFilters_) {
-    if (readColumnSet_.count(field.toString()) == 0) {
-      readColumnSet_.emplace(field.toString());
-      readColumnNames_.emplace_back(field.toString());
+    VELOX_CHECK(
+        !field.path().empty() &&
+            field.path()[0]->kind() == common::SubfieldKind::kNestedField,
+        "Only simple field references are supported in subfield filters");
+    const auto& fieldName =
+        static_cast<const common::Subfield::NestedField*>(field.path()[0].get())
+            ->name();
+    if (readColumnSet_.count(fieldName) == 0) {
+      readColumnSet_.emplace(fieldName);
+      readColumnNames_.emplace_back(fieldName);
     }
   }
   if (remainingFilter) {

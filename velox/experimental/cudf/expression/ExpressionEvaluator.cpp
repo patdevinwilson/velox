@@ -2497,6 +2497,285 @@ class StDistanceFunction : public CudfFunction {
   bool polygonOnLeft_{false};
 };
 
+/// Shared GPU upload of a constant POLYGON/ENVELOPE for Within/Intersects.
+struct GpuConstantPolygon {
+  rmm::device_uvector<double> xy;
+  rmm::device_uvector<int32_t> partEnds;
+  int32_t numParts{0};
+  int32_t numPoints{0};
+
+  GpuConstantPolygon(
+      std::size_t xyCount,
+      std::size_t partCount,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr)
+      : xy(xyCount, stream, mr),
+        partEnds(partCount, stream, mr),
+        numParts(static_cast<int32_t>(partCount)),
+        numPoints(static_cast<int32_t>(xyCount / 2)) {}
+
+  DevicePolygonView view() const {
+    return DevicePolygonView{xy.data(), partEnds.data(), numParts, numPoints};
+  }
+};
+
+std::shared_ptr<GpuConstantPolygon> uploadConstantPolygon(
+    const std::shared_ptr<velox::exec::ConstantExpr>& constantExpr,
+    const char* fnName) {
+  auto vec = constantExpr->value();
+  VELOX_CHECK(!vec->isNullAt(0), "{} constant geometry is null", fnName);
+  auto sv = vec->as<SimpleVector<StringView>>()->valueAt(0);
+  std::string_view bytes(sv.data(), sv.size());
+  VELOX_CHECK(!bytes.empty(), "{} constant geometry is empty", fnName);
+  auto tag = static_cast<uint8_t>(bytes[0]);
+  constexpr uint8_t kPolygonTag = 4;
+  constexpr uint8_t kEnvelopeTag = 7;
+  VELOX_CHECK(
+      tag == kPolygonTag || tag == kEnvelopeTag,
+      "{} GPU constant polygon path expects POLYGON/ENVELOPE, got tag {}",
+      fnName,
+      tag);
+  std::vector<double> xy;
+  std::vector<int32_t> partEnds;
+  VELOX_CHECK(
+      parseVeloxPolygon(bytes, xy, partEnds),
+      "{} GPU failed to parse constant POLYGON/ENVELOPE",
+      fnName);
+  auto stream = cudf::get_default_stream(cudf::allow_default_stream);
+  auto mr = get_temp_mr();
+  auto poly =
+      std::make_shared<GpuConstantPolygon>(xy.size(), partEnds.size(), stream, mr);
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      poly->xy.data(),
+      xy.data(),
+      xy.size() * sizeof(double),
+      cudaMemcpyHostToDevice,
+      stream.value()));
+  CUDF_CUDA_TRY(cudaMemcpyAsync(
+      poly->partEnds.data(),
+      partEnds.data(),
+      partEnds.size() * sizeof(int32_t),
+      cudaMemcpyHostToDevice,
+      stream.value()));
+  stream.synchronize();
+  return poly;
+}
+
+/// Phase-2 ST_Within(point, polygon) for SpatialBench Q4/Q6/Q10/Q11.
+class StWithinFunction : public CudfFunction {
+ public:
+  explicit StWithinFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 2, "ST_Within expects 2 inputs");
+    using velox::exec::ConstantExpr;
+    if (auto c = std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1])) {
+      constPolygon_ = uploadConstantPolygon(c, "ST_Within");
+    } else if (
+        auto c = std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[0])) {
+      VELOX_FAIL(
+          "ST_Within GPU expects POINT column vs constant POLYGON (Q2/Q4 order)");
+    }
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      [[maybe_unused]] cudf::size_type numRows,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    rmm::device_scalar<int32_t> invalid(0, stream, mr);
+    if (constPolygon_) {
+      VELOX_CHECK_EQ(inputColumns.size(), 1);
+      auto out = pointToConstantPolygonWithin(
+          asView(inputColumns[0]),
+          constPolygon_->view(),
+          invalid.data(),
+          stream,
+          mr);
+      throwIfInvalidGeometryType(invalid, stream);
+      return out;
+    }
+
+    std::unique_ptr<cudf::column> leftCol;
+    std::unique_ptr<cudf::column> rightCol;
+    cudf::column_view leftView;
+    cudf::column_view rightView;
+    if (leftScalar_) {
+      VELOX_CHECK_EQ(inputColumns.size(), 1);
+      rightView = asView(inputColumns[0]);
+      leftCol = cudf::make_column_from_scalar(
+          *leftScalar_, rightView.size(), stream, mr);
+      leftView = leftCol->view();
+    } else if (rightScalar_) {
+      VELOX_CHECK_EQ(inputColumns.size(), 1);
+      leftView = asView(inputColumns[0]);
+      rightCol = cudf::make_column_from_scalar(
+          *rightScalar_, leftView.size(), stream, mr);
+      rightView = rightCol->view();
+    } else {
+      VELOX_CHECK_EQ(inputColumns.size(), 2);
+      leftView = asView(inputColumns[0]);
+      rightView = asView(inputColumns[1]);
+    }
+    auto out =
+        geometryWithin(leftView, rightView, invalid.data(), stream, mr);
+    // Invalid/unsupported rows are already nulled in the output; do not fail
+    // the whole batch (Q10 has mixed multipolygon zones + sparse bad WKB).
+    (void)invalid;
+    return out;
+  }
+
+ private:
+  std::unique_ptr<cudf::scalar> leftScalar_;
+  std::unique_ptr<cudf::scalar> rightScalar_;
+  std::shared_ptr<GpuConstantPolygon> constPolygon_;
+};
+
+/// Phase-2 ST_Intersects for SpatialBench Q2 (point∩zone) and Q6 (bbox∩zone).
+class StIntersectsFunction : public CudfFunction {
+ public:
+  explicit StIntersectsFunction(
+      const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 2, "ST_Intersects expects 2 inputs");
+    using velox::exec::ConstantExpr;
+    if (auto c = std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[0])) {
+      leftScalar_ = makeScalarFromConstantExpr(c);
+      auto sv = c->value()->as<SimpleVector<StringView>>()->valueAt(0);
+      auto tag = static_cast<uint8_t>(sv.data()[0]);
+      constexpr uint8_t kPolygonTag = 4;
+      constexpr uint8_t kEnvelopeTag = 7;
+      if (tag == kPolygonTag || tag == kEnvelopeTag) {
+        constPolygon_ = uploadConstantPolygon(c, "ST_Intersects");
+      }
+    } else if (
+        auto c = std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[1])) {
+      rightScalar_ = makeScalarFromConstantExpr(c);
+      auto sv = c->value()->as<SimpleVector<StringView>>()->valueAt(0);
+      auto tag = static_cast<uint8_t>(sv.data()[0]);
+      constexpr uint8_t kPolygonTag = 4;
+      constexpr uint8_t kEnvelopeTag = 7;
+      if (tag == kPolygonTag || tag == kEnvelopeTag) {
+        constPolygon_ = uploadConstantPolygon(c, "ST_Intersects");
+      }
+    }
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      [[maybe_unused]] cudf::size_type numRows,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    rmm::device_scalar<int32_t> invalid(0, stream, mr);
+
+    auto emptyBool = [&](cudf::size_type n) {
+      return cudf::make_numeric_column(
+          cudf::data_type{cudf::type_id::BOOL8},
+          n,
+          cudf::mask_state::ALL_NULL,
+          stream,
+          mr);
+    };
+
+    // Constant POLYGON/ENVELOPE vs column — never broadcast via
+    // make_column_from_scalar (can yield STRING columns without children).
+    if (constPolygon_ && inputColumns.size() == 1) {
+      auto col = asView(inputColumns[0]);
+      if (col.size() == 0) {
+        return emptyBool(0);
+      }
+      VELOX_CHECK(
+          col.type().id() == cudf::type_id::STRING,
+          "ST_Intersects constant-polygon path expects STRING geometry");
+      auto out = geometryIntersectsConstantPolygon(
+          col, constPolygon_->view(), invalid.data(), stream, mr);
+      throwIfInvalidGeometryType(invalid, stream);
+      return out;
+    }
+
+    std::unique_ptr<cudf::column> leftCol;
+    std::unique_ptr<cudf::column> rightCol;
+    cudf::column_view leftView;
+    cudf::column_view rightView;
+    if (leftScalar_) {
+      VELOX_CHECK_EQ(inputColumns.size(), 1);
+      rightView = asView(inputColumns[0]);
+      if (rightView.size() == 0) {
+        return emptyBool(0);
+      }
+      leftCol = cudf::make_column_from_scalar(
+          *leftScalar_, rightView.size(), stream, mr);
+      leftView = leftCol->view();
+    } else if (rightScalar_) {
+      VELOX_CHECK_EQ(inputColumns.size(), 1);
+      leftView = asView(inputColumns[0]);
+      if (leftView.size() == 0) {
+        return emptyBool(0);
+      }
+      rightCol = cudf::make_column_from_scalar(
+          *rightScalar_, leftView.size(), stream, mr);
+      rightView = rightCol->view();
+    } else {
+      VELOX_CHECK_EQ(inputColumns.size(), 2);
+      leftView = asView(inputColumns[0]);
+      rightView = asView(inputColumns[1]);
+      if (leftView.size() == 0) {
+        return emptyBool(0);
+      }
+    }
+    auto out =
+        geometryIntersects(leftView, rightView, invalid.data(), stream, mr);
+    throwIfInvalidGeometryType(invalid, stream);
+    return out;
+  }
+
+ private:
+  std::unique_ptr<cudf::scalar> leftScalar_;
+  std::unique_ptr<cudf::scalar> rightScalar_;
+  std::shared_ptr<GpuConstantPolygon> constPolygon_;
+};
+
+/// Phase-2 ST_Contains(poly, point) ≡ ST_Within(point, poly).
+class StContainsFunction : public CudfFunction {
+ public:
+  explicit StContainsFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 2, "ST_Contains expects 2 inputs");
+    using velox::exec::ConstantExpr;
+    if (auto c = std::dynamic_pointer_cast<ConstantExpr>(expr->inputs()[0])) {
+      constPolygon_ = uploadConstantPolygon(c, "ST_Contains");
+    }
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      [[maybe_unused]] cudf::size_type numRows,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    rmm::device_scalar<int32_t> invalid(0, stream, mr);
+    if (constPolygon_) {
+      VELOX_CHECK_EQ(inputColumns.size(), 1);
+      auto out = pointToConstantPolygonWithin(
+          asView(inputColumns[0]),
+          constPolygon_->view(),
+          invalid.data(),
+          stream,
+          mr);
+      throwIfInvalidGeometryType(invalid, stream);
+      return out;
+    }
+    VELOX_CHECK_EQ(inputColumns.size(), 2);
+    // ST_Contains(a, b) = ST_Within(b, a)
+    auto out = geometryWithin(
+        asView(inputColumns[1]),
+        asView(inputColumns[0]),
+        invalid.data(),
+        stream,
+        mr);
+    throwIfInvalidGeometryType(invalid, stream);
+    return out;
+  }
+
+ private:
+  std::shared_ptr<GpuConstantPolygon> constPolygon_;
+};
+
 /// TIMESTAMP - TIMESTAMP → INTERVAL DAY TO SECOND (milliseconds), matching
 /// Presto TimestampMinusFunction. Needed for SpatialBench Q3:
 /// AVG(t_dropofftime - t_pickuptime).
@@ -2640,6 +2919,116 @@ class StLengthFunction : public CudfFunction {
         lineStringLength(asView(inputColumns[0]), invalid.data(), stream, mr);
     throwIfInvalidGeometryType(invalid, stream);
     return out;
+  }
+};
+
+/// Phase 3: ST_Area for POLYGON / MULTI_POLYGON / ENVELOPE (SpatialBench Q5/Q9).
+class StAreaFunction : public CudfFunction {
+ public:
+  explicit StAreaFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 1, "ST_Area expects 1 input");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      [[maybe_unused]] cudf::size_type numRows,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    rmm::device_scalar<int32_t> invalid(0, stream, mr);
+    auto out =
+        geometryArea(asView(inputColumns[0]), invalid.data(), stream, mr);
+    throwIfInvalidGeometryType(invalid, stream);
+    return out;
+  }
+};
+
+/// Phase 3: ST_Intersection for polygon pairs (SpatialBench Q9 IoU).
+class StIntersectionFunction : public CudfFunction {
+ public:
+  explicit StIntersectionFunction(
+      const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 2, "ST_Intersection expects 2 inputs");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      [[maybe_unused]] cudf::size_type numRows,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    VELOX_CHECK_EQ(inputColumns.size(), 2);
+    rmm::device_scalar<int32_t> invalid(0, stream, mr);
+    auto out = geometryIntersection(
+        asView(inputColumns[0]),
+        asView(inputColumns[1]),
+        invalid.data(),
+        stream,
+        mr);
+    throwIfInvalidGeometryType(invalid, stream);
+    return out;
+  }
+};
+
+/// Phase 3: geometry_union(array(geometry)) for SpatialBench Q5 point lists.
+class GeometryUnionFunction : public CudfFunction {
+ public:
+  explicit GeometryUnionFunction(
+      const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 1, "geometry_union expects 1 input");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      [[maybe_unused]] cudf::size_type numRows,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    rmm::device_scalar<int32_t> invalid(0, stream, mr);
+    auto out = geometryUnionFromList(
+        asView(inputColumns[0]), invalid.data(), stream, mr);
+    throwIfInvalidGeometryType(invalid, stream);
+    return out;
+  }
+};
+
+/// Phase 3: ST_ConvexHull for POINT / MULTI_POINT (SpatialBench Q5).
+class StConvexHullFunction : public CudfFunction {
+ public:
+  explicit StConvexHullFunction(
+      const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK_EQ(expr->inputs().size(), 1, "ST_ConvexHull expects 1 input");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& inputColumns,
+      [[maybe_unused]] cudf::size_type numRows,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const override {
+    rmm::device_scalar<int32_t> invalid(0, stream, mr);
+    auto out =
+        geometryConvexHull(asView(inputColumns[0]), invalid.data(), stream, mr);
+    throwIfInvalidGeometryType(invalid, stream);
+    return out;
+  }
+};
+
+/// ST_KNN join predicate stub: NestedLoopJoin / SpatialJoin KNN path must
+/// short-circuit before evaluating this. Returning all-true previously hid
+/// CrossJoin+Filter mis-plans as full cartesian products.
+class StKnnFunction : public CudfFunction {
+ public:
+  explicit StKnnFunction(const std::shared_ptr<velox::exec::Expr>& expr) {
+    VELOX_CHECK(
+        expr->inputs().size() == 3 || expr->inputs().size() == 4,
+        "ST_KNN expects 3 or 4 inputs");
+  }
+
+  ColumnOrView eval(
+      std::vector<ColumnOrView>& /*inputColumns*/,
+      cudf::size_type /*numRows*/,
+      rmm::cuda_stream_view /*stream*/,
+      rmm::device_async_resource_ref /*mr*/) const override {
+    VELOX_FAIL(
+        "ST_KNN must run as a GPU NestedLoopJoin/SpatialJoin predicate, "
+        "not as a row-wise filter over a cross product");
   }
 };
 
@@ -3384,6 +3773,42 @@ bool registerBuiltinFunctions(const std::string& prefix) {
            .argumentType("geometry")
            .build()});
 
+  registerCudfFunction(
+      prefix + "st_within",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<StWithinFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("boolean")
+           .argumentType("geometry")
+           .argumentType("geometry")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "st_intersects",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<StIntersectsFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("boolean")
+           .argumentType("geometry")
+           .argumentType("geometry")
+           .build()});
+
+  registerCudfFunction(
+      prefix + "st_contains",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<StContainsFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("boolean")
+           .argumentType("geometry")
+           .argumentType("geometry")
+           .build()});
+
   registerCudfFunctions(
       {prefix + "array_constructor", "array_constructor"},
       [](const std::string&,
@@ -3417,6 +3842,76 @@ bool registerBuiltinFunctions(const std::string& prefix) {
       {FunctionSignatureBuilder()
            .returnType("double")
            .argumentType("geometry")
+           .build()});
+
+  // Phase 3: ST_Area — SpatialBench Q5 (hull area) / Q9 (IoU areas).
+  registerCudfFunction(
+      prefix + "st_area",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<StAreaFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("double")
+           .argumentType("geometry")
+           .build()});
+
+  // Phase 3: ST_Intersection — SpatialBench Q9 overlap polygons.
+  registerCudfFunction(
+      prefix + "st_intersection",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<StIntersectionFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("geometry")
+           .argumentType("geometry")
+           .argumentType("geometry")
+           .build()});
+
+  // Phase 3: geometry_union — SpatialBench Q5 point-list → MULTI_POINT.
+  registerCudfFunction(
+      prefix + "geometry_union",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<GeometryUnionFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("geometry")
+           .argumentType("array(geometry)")
+           .build()});
+
+  // Phase 3: ST_ConvexHull — SpatialBench Q5 travel-hull.
+  registerCudfFunction(
+      prefix + "st_convexhull",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<StConvexHullFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("geometry")
+           .argumentType("geometry")
+           .build()});
+
+  // Phase 3: ST_KNN — SpatialBench Q12 k-NN join predicate (handled in NLJ).
+  registerCudfFunction(
+      prefix + "st_knn",
+      [](const std::string&,
+         const std::shared_ptr<velox::exec::Expr>& expr) {
+        return std::make_shared<StKnnFunction>(expr);
+      },
+      {FunctionSignatureBuilder()
+           .returnType("boolean")
+           .argumentType("geometry")
+           .argumentType("geometry")
+           .argumentType("integer")
+           .argumentType("boolean")
+           .build(),
+       FunctionSignatureBuilder()
+           .returnType("boolean")
+           .argumentType("geometry")
+           .argumentType("geometry")
+           .argumentType("integer")
            .build()});
 
   return true;

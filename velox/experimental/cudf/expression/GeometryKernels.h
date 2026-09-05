@@ -116,4 +116,18 @@ std::unique_ptr<cudf::column> lineStringLength(
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr);
 
+/// Great-circle distance between (lat1, lon1) and (lat2, lon2), computed via
+/// cuSpatial's header-only `cuspatial::haversine_distance` kernel (see
+/// GeometryKernels.cu for why cuSpatial is vendored header-only). Matches
+/// BingTileType::greatCircleDistance's radius constant by default (pass the
+/// same `radiusKm` used there). Result is null wherever any input is null.
+std::unique_ptr<cudf::column> haversineGreatCircleDistance(
+    cudf::column_view const& lat1,
+    cudf::column_view const& lon1,
+    cudf::column_view const& lat2,
+    cudf::column_view const& lon2,
+    double radiusKm,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr);
+
 } // namespace facebook::velox::cudf_velox

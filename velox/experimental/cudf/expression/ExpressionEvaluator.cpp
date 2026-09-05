@@ -2051,17 +2051,13 @@ std::unique_ptr<cudf::column> RowConstructorFunction::makeOwnedColumn(
 }
 
 
-/// GPU great-circle distance using the Vincenty formula (matching
-/// BingTileType::greatCircleDistance). Builds a cudf::ast::tree so the
-/// entire computation fuses into a single GPU kernel via compute_column.
-///
-/// Vincenty formula:
-///   sinLat1, cosLat1, sinLat2, cosLat2 = trig of radian latitudes
-///   deltaLon = lon1_rad - lon2_rad
-///   t1 = cos2 * sin(deltaLon)
-///   t2 = cosLat1 * sinLat2 - sinLat1 * cosLat2 * cos(deltaLon)
-///   t3 = sinLat1 * sinLat2 + cosLat1 * cosLat2 * cos(deltaLon)
-///   result = atan2(sqrt(t1*t1 + t2*t2), t3) * R
+/// GPU great-circle distance using cuSpatial's `haversine_distance` kernel
+/// (matching BingTileType::greatCircleDistance's radius constant). See
+/// GeometryKernels.cu's `haversineGreatCircleDistance` for why cuSpatial
+/// (rather than a hand-rolled AST formula) computes this, and for the note
+/// on haversine vs. the previous Vincenty/atan2 formulation: both are exact
+/// great-circle-distance formulas for a sphere and agree to floating-point
+/// precision away from antipodal points.
 class GreatCircleDistanceFunction : public CudfFunction {
  public:
   explicit GreatCircleDistanceFunction(const core::TypedExprPtr& expr) {
@@ -2080,90 +2076,8 @@ class GreatCircleDistanceFunction : public CudfFunction {
     auto lat2 = asView(inputColumns[2]);
     auto lon2 = asView(inputColumns[3]);
 
-    auto f64 = cudf::data_type{cudf::type_id::FLOAT64};
-    cudf::numeric_scalar<double> deg2rad(M_PI / 180.0, true, stream, mr);
-    cudf::numeric_scalar<double> R(kEarthRadiusKm, true, stream, mr);
-
-    // Convert to radians
-    auto lat1Rad = cudf::binary_operation(
-        lat1, deg2rad, cudf::binary_operator::MUL, f64, stream, mr);
-    auto lon1Rad = cudf::binary_operation(
-        lon1, deg2rad, cudf::binary_operator::MUL, f64, stream, mr);
-    auto lat2Rad = cudf::binary_operation(
-        lat2, deg2rad, cudf::binary_operator::MUL, f64, stream, mr);
-    auto lon2Rad = cudf::binary_operation(
-        lon2, deg2rad, cudf::binary_operator::MUL, f64, stream, mr);
-
-    // Vincenty formula (matches BingTileType::greatCircleDistance)
-    auto sinLat1 = cudf::unary_operation(
-        lat1Rad->view(), cudf::unary_operator::SIN, stream, mr);
-    auto cosLat1 = cudf::unary_operation(
-        lat1Rad->view(), cudf::unary_operator::COS, stream, mr);
-    auto sinLat2 = cudf::unary_operation(
-        lat2Rad->view(), cudf::unary_operator::SIN, stream, mr);
-    auto cosLat2 = cudf::unary_operation(
-        lat2Rad->view(), cudf::unary_operator::COS, stream, mr);
-
-    auto deltaLon = cudf::binary_operation(
-        lon1Rad->view(), lon2Rad->view(),
-        cudf::binary_operator::SUB, f64, stream, mr);
-    auto sinDeltaLon = cudf::unary_operation(
-        deltaLon->view(), cudf::unary_operator::SIN, stream, mr);
-    auto cosDeltaLon = cudf::unary_operation(
-        deltaLon->view(), cudf::unary_operator::COS, stream, mr);
-
-    // t1 = cos(lat2) * sin(deltaLon)
-    auto t1 = cudf::binary_operation(
-        cosLat2->view(), sinDeltaLon->view(),
-        cudf::binary_operator::MUL, f64, stream, mr);
-
-    // t2 = cos(lat1)*sin(lat2) - sin(lat1)*cos(lat2)*cos(deltaLon)
-    auto cs = cudf::binary_operation(
-        cosLat1->view(), sinLat2->view(),
-        cudf::binary_operator::MUL, f64, stream, mr);
-    auto scc = cudf::binary_operation(
-        sinLat1->view(), cosLat2->view(),
-        cudf::binary_operator::MUL, f64, stream, mr);
-    auto sccc = cudf::binary_operation(
-        scc->view(), cosDeltaLon->view(),
-        cudf::binary_operator::MUL, f64, stream, mr);
-    auto t2 = cudf::binary_operation(
-        cs->view(), sccc->view(),
-        cudf::binary_operator::SUB, f64, stream, mr);
-
-    // t3 = sin(lat1)*sin(lat2) + cos(lat1)*cos(lat2)*cos(deltaLon)
-    auto ss = cudf::binary_operation(
-        sinLat1->view(), sinLat2->view(),
-        cudf::binary_operator::MUL, f64, stream, mr);
-    auto ccc = cudf::binary_operation(
-        cosLat1->view(), cosLat2->view(),
-        cudf::binary_operator::MUL, f64, stream, mr);
-    auto cccc = cudf::binary_operation(
-        ccc->view(), cosDeltaLon->view(),
-        cudf::binary_operator::MUL, f64, stream, mr);
-    auto t3 = cudf::binary_operation(
-        ss->view(), cccc->view(),
-        cudf::binary_operator::ADD, f64, stream, mr);
-
-    // atan2(sqrt(t1*t1 + t2*t2), t3) * R
-    auto t1sq = cudf::binary_operation(
-        t1->view(), t1->view(),
-        cudf::binary_operator::MUL, f64, stream, mr);
-    auto t2sq = cudf::binary_operation(
-        t2->view(), t2->view(),
-        cudf::binary_operator::MUL, f64, stream, mr);
-    auto sumSq = cudf::binary_operation(
-        t1sq->view(), t2sq->view(),
-        cudf::binary_operator::ADD, f64, stream, mr);
-    auto norm = cudf::unary_operation(
-        sumSq->view(), cudf::unary_operator::SQRT, stream, mr);
-    auto angle = cudf::binary_operation(
-        norm->view(), t3->view(),
-        cudf::binary_operator::ATAN2, f64, stream, mr);
-
-    return cudf::binary_operation(
-        angle->view(), R,
-        cudf::binary_operator::MUL, f64, stream, mr);
+    return haversineGreatCircleDistance(
+        lat1, lon1, lat2, lon2, kEarthRadiusKm, stream, mr);
   }
 
  private:

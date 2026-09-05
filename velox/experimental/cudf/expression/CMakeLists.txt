@@ -47,6 +47,7 @@ target_link_libraries(
   PUBLIC cudf::cudf
   PRIVATE
     arrow
+    cuspatial::headers
     velox_common_base
     velox_cudf_expression_registry
     velox_cudf_vector

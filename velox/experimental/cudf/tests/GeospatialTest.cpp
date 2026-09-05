@@ -148,10 +148,18 @@ TEST_F(CudfGeospatialTest, greatCircleDistanceSamePoint) {
                   .project({"great_circle_distance(lat1, lon1, lat2, lon2)"})
                   .planNode();
 
-  auto expected =
-      makeRowVector({"p0"}, {makeFlatVector<double>({0.0, 0.0, 0.0})});
-
-  AssertQueryBuilder(plan).assertResults(expected);
+  // cuSpatial's haversine_distance computes
+  // 2*asin(sqrt(sin^2(dlat/2) + cos(lat1)*cos(lat2)*sin^2(dlon/2))), which is
+  // mathematically exactly 0 for identical points (dlat = dlon = 0) but can
+  // land on the order of 1e-13 km due to floating-point rounding in the
+  // trig evaluations rather than an exact 0.0. Use a tolerance instead of
+  // assertResults' exact equality.
+  auto result = AssertQueryBuilder(plan).copyResults(pool());
+  auto resultVec = result->childAt(0)->asFlatVector<double>();
+  ASSERT_EQ(resultVec->size(), 3);
+  EXPECT_NEAR(resultVec->valueAt(0), 0.0, 1e-9);
+  EXPECT_NEAR(resultVec->valueAt(1), 0.0, 1e-9);
+  EXPECT_NEAR(resultVec->valueAt(2), 0.0, 1e-9);
 }
 
 TEST_F(CudfGeospatialTest, greatCircleDistanceKnownPairs) {

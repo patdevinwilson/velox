@@ -2092,7 +2092,7 @@ TEST_F(CudfWindowTest, customComparisonWindowKeysFallback) {
   }
 }
 
-TEST_F(CudfWindowTest, fullPartitionAverageFallsBackUntilOptimized) {
+TEST_F(CudfWindowTest, orderedFullPartitionAverageFallsBack) {
   auto data = makeRowVector(
       {"p", "ord", "v"},
       {
@@ -2101,19 +2101,115 @@ TEST_F(CudfWindowTest, fullPartitionAverageFallsBackUntilOptimized) {
           makeNullableFlatVector<double>({10.0, std::nullopt, 30.0, 5.0, 15.0}),
       });
 
-  const std::vector<std::string> expressions = {
-      "avg(v) over (partition by p) as a",
-      "avg(v) over (partition by p order by ord "
-      "rows between unbounded preceding and unbounded following) as a",
-  };
+  auto plan = PlanBuilder()
+                  .values({data})
+                  .window({"avg(v) over (partition by p order by ord "
+                           "rows between unbounded preceding and unbounded "
+                           "following) as a"})
+                  .planNode();
 
-  for (const auto& expression : expressions) {
-    SCOPED_TRACE(expression);
-    auto plan = PlanBuilder().values({data}).window({expression}).planNode();
+  VELOX_ASSERT_THROW(
+      AssertQueryBuilder(plan).copyResults(pool()),
+      "Replacement with cuDF operator failed");
+}
 
-    VELOX_ASSERT_THROW(
-        AssertQueryBuilder(plan).copyResults(pool()),
-        "Replacement with cuDF operator failed");
+TEST_F(CudfWindowTest, floatingAveragePartitionWide) {
+  {
+    SCOPED_TRACE("double, implicit and explicit full frames");
+    auto data = makeRowVector(
+        {"p", "ord", "v"},
+        {
+            makeFlatVector<int32_t>({1, 1, 1, 2, 2, 3, 3}),
+            makeFlatVector<int32_t>({1, 2, 3, 1, 2, 1, 2}),
+            makeNullableFlatVector<double>(
+                {10.0, std::nullopt, 30.0, 5.0, 15.0, std::nullopt, std::nullopt}),
+        });
+
+    auto partitionedExpected = makeRowVector(
+        {"p", "ord", "v", "a"},
+        {
+            makeFlatVector<int32_t>({1, 1, 1, 2, 2, 3, 3}),
+            makeFlatVector<int32_t>({1, 2, 3, 1, 2, 1, 2}),
+            makeNullableFlatVector<double>(
+                {10.0, std::nullopt, 30.0, 5.0, 15.0, std::nullopt, std::nullopt}),
+            makeNullableFlatVector<double>(
+                {20.0, 20.0, 20.0, 10.0, 10.0, std::nullopt, std::nullopt}),
+        });
+    const std::vector<std::string> partitionedExpressions = {
+        "avg(v) over (partition by p) as a",
+        "avg(v) over (partition by p "
+        "rows between unbounded preceding and unbounded following) as a",
+    };
+    for (const auto& expression : partitionedExpressions) {
+      SCOPED_TRACE(expression);
+      auto plan = PlanBuilder().values({data}).window({expression}).planNode();
+      AssertQueryBuilder(plan).assertResults(partitionedExpected);
+    }
+
+    auto globalExpected = makeRowVector(
+        {"p", "ord", "v", "a"},
+        {
+            makeFlatVector<int32_t>({1, 1, 1, 2, 2, 3, 3}),
+            makeFlatVector<int32_t>({1, 2, 3, 1, 2, 1, 2}),
+            makeNullableFlatVector<double>(
+                {10.0, std::nullopt, 30.0, 5.0, 15.0, std::nullopt, std::nullopt}),
+            makeNullableFlatVector<double>(
+                {15.0, 15.0, 15.0, 15.0, 15.0, 15.0, 15.0}),
+        });
+    const std::vector<std::string> globalExpressions = {
+        "avg(v) over () as a",
+        "avg(v) over (rows between unbounded preceding "
+        "and unbounded following) as a",
+    };
+    for (const auto& expression : globalExpressions) {
+      SCOPED_TRACE(expression);
+      auto plan = PlanBuilder().values({data}).window({expression}).planNode();
+      AssertQueryBuilder(plan).assertResults(globalExpected);
+    }
+  }
+
+  {
+    SCOPED_TRACE("real input, double result");
+    auto data = makeRowVector(
+        {"p", "v"},
+        {
+            makeFlatVector<int32_t>({1, 1, 2, 2}),
+            makeFlatVector<float>({10.0F, 30.0F, 5.0F, 15.0F}),
+        });
+    auto expected = makeRowVector(
+        {"p", "v", "a"},
+        {
+            makeFlatVector<int32_t>({1, 1, 2, 2}),
+            makeFlatVector<float>({10.0F, 30.0F, 5.0F, 15.0F}),
+            makeFlatVector<double>({20.0, 20.0, 10.0, 10.0}),
+        });
+    auto plan = PlanBuilder()
+                    .values({data})
+                    .window({"avg(v) over (partition by p) as a"})
+                    .planNode();
+    AssertQueryBuilder(plan).assertResults(expected);
+  }
+
+  {
+    SCOPED_TRACE("null partition key");
+    auto data = makeRowVector(
+        {"p", "v"},
+        {
+            makeNullableFlatVector<int32_t>({std::nullopt, std::nullopt, 1, 1}),
+            makeFlatVector<double>({10.0, 30.0, 4.0, 6.0}),
+        });
+    auto expected = makeRowVector(
+        {"p", "v", "a"},
+        {
+            makeNullableFlatVector<int32_t>({std::nullopt, std::nullopt, 1, 1}),
+            makeFlatVector<double>({10.0, 30.0, 4.0, 6.0}),
+            makeFlatVector<double>({20.0, 20.0, 5.0, 5.0}),
+        });
+    auto plan = PlanBuilder()
+                    .values({data})
+                    .window({"avg(v) over (partition by p) as a"})
+                    .planNode();
+    AssertQueryBuilder(plan).assertResults(expected);
   }
 }
 

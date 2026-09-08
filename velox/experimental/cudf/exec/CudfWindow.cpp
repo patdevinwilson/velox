@@ -27,6 +27,7 @@
 #include "velox/type/Type.h"
 
 #include <cudf/aggregation.hpp>
+#include <cudf/binaryop.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/filling.hpp>
@@ -41,6 +42,8 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/unary.hpp>
+
+#include "velox/experimental/cudf/CudfNoDefaults.h"
 
 #include <nvtx3/nvtx3.hpp>
 
@@ -540,6 +543,13 @@ bool CudfWindow::canRunOnGPU(
       }
     }
 
+    const bool isFullPartition =
+        isFullPartitionFrame(func, !windowNode.sortingKeys().empty());
+    const bool isFloatingAverage = baseName == "avg" &&
+        !func.functionCall->inputs().empty() &&
+        (func.functionCall->inputs()[0]->type()->isReal() ||
+         func.functionCall->inputs()[0]->type()->isDouble());
+
     if (!func.functionCall->inputs().empty()) {
       const auto& argumentType = func.functionCall->inputs()[0]->type();
 
@@ -562,15 +572,28 @@ bool CudfWindow::canRunOnGPU(
         }
         return false;
       }
+
+      // Same shape as decimal AVG in facebookincubator/velox#18784: use the
+      // optimized fully-unbounded SUM/COUNT rolling path, not generic MEAN.
+      // Bounded / running AVG of REAL/DOUBLE stays on the existing rolling
+      // path. ORDER BY plus a full-partition frame still falls back.
+      if (isFloatingAverage && isFullPartition &&
+          !windowNode.sortingKeys().empty()) {
+        if (reason) {
+          *reason =
+              "REAL/DOUBLE AVG only supports partition-wide frames "
+              "without ORDER BY on cuDF";
+        }
+        return false;
+      }
     }
 
-    const bool isFullPartition =
-        isFullPartitionFrame(func, !windowNode.sortingKeys().empty());
     const bool usesRollingFullPartitionPath =
         !windowNode.partitionKeys().empty() ||
         !windowNode.sortingKeys().empty();
 
-    if (baseName == "avg" && isFullPartition && usesRollingFullPartitionPath) {
+    if (baseName == "avg" && !isFloatingAverage && isFullPartition &&
+        usesRollingFullPartitionPath) {
       if (reason) {
         *reason = "Full-partition AVG requires optimized cuDF MEAN support";
       }
@@ -891,12 +914,14 @@ std::unique_ptr<cudf::column> CudfWindow::invokeGroupedRollingWindow(
     bool isFullPartition,
     rmm::cuda_stream_view stream,
     rmm::device_async_resource_ref mr) const {
-  // RANGE frames are handled by the batched grouped_range_rolling_window path
-  // in doGetOutput (see toBatchRangeWindowTypes). canRunOnGPU only accepts
-  // RANGE frames that path can express, so RANGE never reaches here.
+  // Non-full RANGE frames are handled by grouped_range_rolling_window in
+  // doGetOutput. A full-partition frame uses unbounded bounds regardless of
+  // whether SQL expresses it as ROWS or RANGE.
   VELOX_CHECK(
-      func.frame.type != core::WindowNode::WindowType::kRange,
-      "RANGE window frames must be handled by the batched range rolling path");
+      isFullPartition ||
+          func.frame.type != core::WindowNode::WindowType::kRange,
+      "Non-full RANGE window frames must be handled by the batched range "
+      "rolling path");
 
   if (isFullPartition) {
     return cudf::grouped_rolling_window(
@@ -940,6 +965,62 @@ std::unique_ptr<cudf::column> CudfWindow::computeNthValueColumn(
       -1, nullPolicy);
   return invokeGroupedRollingWindow(
       partKeys, inputCol, func, std::move(agg), isFullPartition, stream, mr);
+}
+
+std::unique_ptr<cudf::column> CudfWindow::computeFloatingAverageColumn(
+    const cudf::table_view& partitionKeys,
+    cudf::column_view inputColumn,
+    const core::WindowNode::Function& function,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) const {
+  const bool isFullPartition =
+      isFullPartitionFrame(function, !sortKeyIndices_.empty());
+  VELOX_CHECK(
+      isFullPartition && sortKeyIndices_.empty(),
+      "REAL/DOUBLE AVG only supports partition-wide windows without ORDER BY");
+
+  auto const tempMr = get_temp_mr();
+  std::unique_ptr<cudf::column> widenedInput;
+  cudf::column_view sumInput = inputColumn;
+  // Rolling SUM of REAL is unsupported; widen to FLOAT64 first. COUNT stays on
+  // the original column so nulls are unchanged.
+  if (inputColumn.type().id() == cudf::type_id::FLOAT32) {
+    widenedInput = cudf::cast(
+        inputColumn, cudf::data_type{cudf::type_id::FLOAT64}, stream, tempMr);
+    sumInput = widenedInput->view();
+  }
+
+  // cuDF optimizes fully unbounded rolling windows into reduce-and-repeat for
+  // OVER (), or groupby plus a group-label gather for PARTITION BY. Reusing
+  // that path (same as facebookincubator/velox#18784 for DECIMAL) keeps
+  // row-to-group expansion inside cuDF and avoids quadratic rolling MEAN.
+  auto sumAggregation = cudf::make_sum_aggregation<cudf::rolling_aggregation>();
+  auto sum = invokeGroupedRollingWindow(
+      partitionKeys,
+      sumInput,
+      function,
+      std::move(sumAggregation),
+      isFullPartition,
+      stream,
+      tempMr);
+  auto countAggregation =
+      cudf::make_count_aggregation<cudf::rolling_aggregation>(
+          cudf::null_policy::EXCLUDE);
+  auto count = invokeGroupedRollingWindow(
+      partitionKeys,
+      inputColumn,
+      function,
+      std::move(countAggregation),
+      isFullPartition,
+      stream,
+      tempMr);
+  return cudf::binary_operation(
+      *sum,
+      *count,
+      cudf::binary_operator::DIV,
+      veloxToCudfDataType(function.functionCall->type()),
+      stream,
+      mr);
 }
 
 std::unique_ptr<cudf::column> CudfWindow::computeAggregateColumn(
@@ -1141,7 +1222,16 @@ RowVectorPtr CudfWindow::doGetOutput() {
       }
       const bool isFullPartition =
           isFullPartitionFrame(func, !sortKeyIndices_.empty());
-      if (isFullPartition && sortKeyIndices_.empty() &&
+      const bool isFloatingAverage = baseName == "avg" &&
+          !func.functionCall->inputs().empty() &&
+          (func.functionCall->inputs()[0]->type()->isReal() ||
+           func.functionCall->inputs()[0]->type()->isDouble());
+      if (isFloatingAverage && isFullPartition && sortKeyIndices_.empty() &&
+          partKeys.num_columns() > 0) {
+        windowResultCols[funcIndex] = computeFloatingAverageColumn(
+            partKeys, inputCol, func, stream_, mr);
+      } else if (
+          isFullPartition && sortKeyIndices_.empty() &&
           partKeys.num_columns() == 0) {
         windowResultCols[funcIndex] = computeGlobalAggregate(
             inputCol,

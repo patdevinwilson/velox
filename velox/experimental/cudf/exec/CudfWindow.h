@@ -58,7 +58,12 @@ namespace facebook::velox::cudf_velox {
 ///
 /// Rank-like functions (row_number, rank, dense_rank) use
 /// cudf::groupby::scan with cudf::make_rank_aggregation.
-/// Aggregate windows and lag/lead use cudf::grouped_rolling_window.
+/// Uses cudf::grouped_rolling_window for most aggregate windows and lag/lead.
+/// Supports partition-wide REAL/DOUBLE AVG without ORDER BY, for both OVER ()
+/// and OVER (PARTITION BY ...), using cuDF's optimized fully unbounded SUM
+/// and COUNT rolling path (same approach as DECIMAL in
+/// facebookincubator/velox#18784). Ordered or non-full frames still fall
+/// back to CPU for AVG. DECIMAL AVG remains CPU until that PR lands.
 class CudfWindow : public CudfOperatorBase {
  public:
   CudfWindow(
@@ -138,8 +143,18 @@ class CudfWindow : public CudfOperatorBase {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const;
 
-  // Dispatch ROWS window frames to grouped_rolling_window. RANGE frames are
-  // handled separately by the batched grouped_range_rolling_window path.
+  // Computes partition-wide REAL/DOUBLE AVG from fully unbounded SUM and
+  // non-null COUNT. cuDF expands partition results to input rows. REAL input
+  // is widened to FLOAT64 before SUM.
+  std::unique_ptr<cudf::column> computeFloatingAverageColumn(
+      const cudf::table_view& partitionKeys,
+      cudf::column_view inputColumn,
+      const core::WindowNode::Function& function,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) const;
+
+  // Dispatches ROWS frames and full-partition RANGE frames to
+  // grouped_rolling_window. Other RANGE frames use the batched range path.
   std::unique_ptr<cudf::column> invokeGroupedRollingWindow(
       const cudf::table_view& partKeys,
       cudf::column_view inputCol,

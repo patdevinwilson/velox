@@ -22,6 +22,7 @@ add_library(
   CudfHiveTableHandle.cpp
   CudfSplitReader.cpp
   CudfSplitReaderHelpers.cpp
+  CudfParquetFooterCache.cpp
 )
 
 target_link_libraries(

@@ -15,6 +15,7 @@
  */
 
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
+#include "velox/experimental/cudf/connectors/hive/CudfParquetFooterCache.h"
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/config/Config.h"
@@ -195,6 +196,25 @@ bool CudfHiveConfig::writev2PageHeadersSession(
   return session->get<bool>(
       kWritev2PageHeadersSession,
       config_->get<bool>(kWritev2PageHeaders, false));
+}
+
+bool CudfHiveConfig::parquetFooterCacheEnabled() const {
+  return config_->get<bool>(kParquetFooterCacheEnabled, true);
+}
+
+std::size_t CudfHiveConfig::parquetFooterCacheMaxFiles() const {
+  return config_->get<std::size_t>(kParquetFooterCacheMaxFiles, 64);
+}
+
+CudfParquetFooterCache* CudfHiveConfig::footerCache() const {
+  if (!parquetFooterCacheEnabled()) {
+    return nullptr;
+  }
+  std::call_once(footerCacheOnce_, [this]() {
+    footerCache_ = std::make_shared<CudfParquetFooterCache>(
+        parquetFooterCacheMaxFiles());
+  });
+  return footerCache_.get();
 }
 
 } // namespace facebook::velox::cudf_velox::connector::hive

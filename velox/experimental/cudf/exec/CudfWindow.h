@@ -59,12 +59,14 @@ namespace facebook::velox::cudf_velox {
 /// Rank-like functions (row_number, rank, dense_rank) use
 /// cudf::groupby::scan with cudf::make_rank_aggregation.
 /// Uses cudf::grouped_rolling_window for most aggregate windows and lag/lead.
-/// Supports partition-wide REAL/DOUBLE/DECIMAL AVG for OVER (),
-/// OVER (PARTITION BY ...) and their ORDER BY forms, using cuDF's optimized
-/// fully unbounded SUM and COUNT rolling path. A fully unbounded frame covers
-/// the whole partition, so ORDER BY does not affect the result. Bounded or
-/// running AVG frames still fall back to CPU, as do other AVG input types,
-/// which still require optimized cuDF MEAN.
+/// Full-partition REAL/DOUBLE/DECIMAL AVG runs on cuDF's optimized fully
+/// unbounded SUM and COUNT rolling path, covering OVER (),
+/// OVER (PARTITION BY ...) and their ORDER BY forms; a fully unbounded frame
+/// spans the whole partition, so ORDER BY does not affect the result.
+/// Bounded and running AVG frames use cudf::make_mean_aggregation, except for
+/// DECIMAL input, which has no cuDF rolling MEAN and falls back to CPU.
+/// Full-partition AVG of any other input type also falls back, since rolling
+/// MEAN over an unbounded frame is not optimized in cuDF.
 class CudfWindow : public CudfOperatorBase {
  public:
   CudfWindow(

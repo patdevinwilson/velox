@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/connectors/hive/CudfParquetFooterCache.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReader.h"
 #include "velox/experimental/cudf/tests/utils/CudfHiveConnectorTestBase.h"
 
@@ -22,7 +23,9 @@
 
 #include <cudf/ast/expressions.hpp>
 
+#include <atomic>
 #include <memory>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -144,6 +147,118 @@ TEST_F(CudfSplitReaderTest, buildsPushdownFilterForEachSplitPreparation) {
   EXPECT_EQ(reader.splitFilter(), &secondSplitFilter);
   EXPECT_TRUE(reader.hasSplitFilter());
   EXPECT_EQ(runtimeStats.processedSplits, 2);
+}
+
+TEST(CudfParquetFooterCacheTest, coalescesConcurrentLoadsAndCopiesOnHit) {
+  CudfParquetFooterCache cache(8);
+  std::atomic<int> loads{0};
+  auto loader = [&]() {
+    ++loads;
+    cudf::io::parquet::FileMetaData meta;
+    meta.num_rows = 42;
+    return CudfParquetFooterCache::Footers{meta};
+  };
+
+  auto first = cache.getOrLoad("/tmp/a.parquet", loader);
+  auto second = cache.getOrLoad("/tmp/a.parquet", loader);
+  EXPECT_EQ(loads, 1);
+  EXPECT_EQ(cache.misses(), 1);
+  EXPECT_EQ(cache.hits(), 1);
+  ASSERT_EQ(first.size(), 1);
+  ASSERT_EQ(second.size(), 1);
+  EXPECT_EQ(first.front().num_rows, 42);
+  EXPECT_EQ(second.front().num_rows, 42);
+}
+
+TEST(CudfParquetFooterCacheTest, retriesAfterLoadFailure) {
+  CudfParquetFooterCache cache(8);
+  std::atomic<int> loads{0};
+  auto loader = [&]() {
+    if (loads.fetch_add(1) == 0) {
+      throw std::runtime_error("boom");
+    }
+    return CudfParquetFooterCache::Footers{};
+  };
+  EXPECT_THROW(cache.getOrLoad("/tmp/b.parquet", loader), std::runtime_error);
+  EXPECT_NO_THROW(cache.getOrLoad("/tmp/b.parquet", loader));
+  EXPECT_EQ(loads, 2);
+}
+
+TEST_F(CudfSplitReaderTest, reusesFooterAcrossSplitReaders) {
+  auto rowType = ROW({"c0"}, {BIGINT()});
+  auto dataFile = common::testutil::TempFilePath::create();
+  writeToFile(
+      dataFile->getPath(),
+      makeRowVector({"c0"}, {makeFlatVector<int64_t>({1, 2, 3})}));
+
+  auto properties = std::make_shared<config::ConfigBase>(
+      std::unordered_map<std::string, std::string>{
+          {std::string(CudfHiveConfig::kParquetFooterCacheEnabled), "true"},
+      });
+  auto hiveConfig = std::make_shared<CudfHiveConfig>(properties);
+  ::facebook::velox::connector::ConnectorQueryCtx connectorQueryCtx(
+      pool_.get(),
+      pool_.get(),
+      properties.get(),
+      nullptr,
+      common::PrefixSortConfig{},
+      nullptr,
+      nullptr,
+      "query.CudfSplitReaderTest",
+      "task.CudfSplitReaderTest",
+      "plan.CudfSplitReaderTest",
+      0,
+      "");
+  FileHandleFactory fileHandleFactory(
+      std::make_unique<FileHandleCache>(1000),
+      std::make_unique<FileHandleGenerator>());
+
+  auto split1 =
+      CudfHiveConnectorSplitBuilder(dataFile->getPath())
+          .connectorId(
+              ::facebook::velox::cudf_velox::exec::test::kCudfHiveConnectorId)
+          .build();
+  auto split2 =
+      CudfHiveConnectorSplitBuilder(dataFile->getPath())
+          .connectorId(
+              ::facebook::velox::cudf_velox::exec::test::kCudfHiveConnectorId)
+          .build();
+  auto tableHandle =
+      ::facebook::velox::cudf_velox::exec::test::CudfHiveConnectorTestBase::
+          makeTableHandle("parquet_table", rowType);
+  MetadataOnlySplitReader first(
+      std::move(split1),
+      tableHandle,
+      rowType,
+      {"c0"},
+      &fileHandleFactory,
+      ioExecutor_.get(),
+      &connectorQueryCtx,
+      hiveConfig,
+      std::make_shared<io::IoStatistics>(),
+      std::make_shared<IoStats>(),
+      false,
+      nullptr);
+  MetadataOnlySplitReader second(
+      std::move(split2),
+      tableHandle,
+      rowType,
+      {"c0"},
+      &fileHandleFactory,
+      ioExecutor_.get(),
+      &connectorQueryCtx,
+      hiveConfig,
+      std::make_shared<io::IoStatistics>(),
+      std::make_shared<IoStats>(),
+      false,
+      nullptr);
+
+  dwio::common::RuntimeStats runtimeStats;
+  first.prepareSplit(runtimeStats);
+  second.prepareSplit(runtimeStats);
+  ASSERT_NE(hiveConfig->footerCache(), nullptr);
+  EXPECT_EQ(hiveConfig->footerCache()->misses(), 1);
+  EXPECT_EQ(hiveConfig->footerCache()->hits(), 1);
 }
 
 } // namespace

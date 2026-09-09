@@ -15,6 +15,8 @@
  */
 
 #include "velox/experimental/cudf/CudfNoDefaults.h"
+#include "velox/experimental/cudf/connectors/hive/CudfHiveConfig.h"
+#include "velox/experimental/cudf/connectors/hive/CudfParquetFooterCache.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReader.h"
 #include "velox/experimental/cudf/connectors/hive/CudfSplitReaderHelpers.h"
 #include "velox/experimental/cudf/exec/GpuResources.h"
@@ -495,14 +497,22 @@ void CudfSplitReader::fileMetaDatas() {
       dataSource_,
       "CudfSplitReader does not have a datasource. Call setupCudfDataSource() first");
 
-  // Wrap the existing datasource without transferring ownership.
-  std::vector<std::unique_ptr<cudf::io::datasource>> sources;
-  sources.push_back(cudf::io::datasource::create(dataSource_.get()));
-  fileMetaData_ = cudf::io::read_parquet_footers(sources);
-  VELOX_CHECK_GE(
-      fileMetaData_.size(),
-      1,
-      "CudfSplitReader failed to read any parquet metadatas");
+  auto loadFooters = [&]() {
+    std::vector<std::unique_ptr<cudf::io::datasource>> sources;
+    sources.push_back(cudf::io::datasource::create(dataSource_.get()));
+    auto footers = cudf::io::read_parquet_footers(sources);
+    VELOX_CHECK_GE(
+        footers.size(),
+        1,
+        "CudfSplitReader failed to read any parquet metadatas");
+    return footers;
+  };
+
+  if (auto* cache = cudfHiveConfig_->footerCache()) {
+    fileMetaData_ = cache->getOrLoad(split_->filePath, loadFooters);
+  } else {
+    fileMetaData_ = loadFooters();
+  }
 
   if (pushdownFilterBuilder_) {
     VELOX_CHECK_EQ(

@@ -17,9 +17,12 @@
 #pragma once
 
 #include "velox/common/config/Config.h"
+#include "velox/experimental/cudf/connectors/hive/CudfParquetFooterCache.h"
 
 #include <cudf/types.hpp>
 
+#include <memory>
+#include <mutex>
 #include <optional>
 
 namespace facebook::velox::config {
@@ -87,6 +90,13 @@ class CudfHiveConfig {
       "cudf.hive.use-experimental-reader";
   static constexpr const char* kUseExperimentalCudfReaderSession =
       "cudf.hive.use_experimental_reader";
+
+  /// Cache parsed Parquet FileMetaData per file path so Hive splits of the
+  /// same file do not re-parse a large footer. Default true.
+  static constexpr const char* kParquetFooterCacheEnabled =
+      "cudf.hive.parquet-footer-cache-enabled";
+  static constexpr const char* kParquetFooterCacheMaxFiles =
+      "cudf.hive.parquet-footer-cache-max-files";
 
   // Writer config options
 
@@ -170,7 +180,16 @@ class CudfHiveConfig {
   bool writev2PageHeaders() const;
   bool writev2PageHeadersSession(const config::ConfigBase* session) const;
 
+  bool parquetFooterCacheEnabled() const;
+  std::size_t parquetFooterCacheMaxFiles() const;
+
+  /// Per-connector cache of parsed Parquet footers. Null when caching is
+  /// disabled.
+  CudfParquetFooterCache* footerCache() const;
+
  private:
   std::shared_ptr<const config::ConfigBase> config_;
+  mutable std::once_flag footerCacheOnce_;
+  mutable std::shared_ptr<CudfParquetFooterCache> footerCache_;
 };
 } // namespace facebook::velox::cudf_velox::connector::hive

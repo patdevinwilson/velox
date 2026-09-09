@@ -59,11 +59,12 @@ namespace facebook::velox::cudf_velox {
 /// Rank-like functions (row_number, rank, dense_rank) use
 /// cudf::groupby::scan with cudf::make_rank_aggregation.
 /// Uses cudf::grouped_rolling_window for most aggregate windows and lag/lead.
-/// Supports partition-wide REAL/DOUBLE AVG without ORDER BY, for both OVER ()
-/// and OVER (PARTITION BY ...), using cuDF's optimized fully unbounded SUM
-/// and COUNT rolling path (same approach as DECIMAL in
-/// facebookincubator/velox#18784). Ordered or non-full frames still fall
-/// back to CPU for AVG. DECIMAL AVG remains CPU until that PR lands.
+/// Supports partition-wide REAL/DOUBLE/DECIMAL AVG for OVER (),
+/// OVER (PARTITION BY ...) and their ORDER BY forms, using cuDF's optimized
+/// fully unbounded SUM and COUNT rolling path. A fully unbounded frame covers
+/// the whole partition, so ORDER BY does not affect the result. Bounded or
+/// running AVG frames still fall back to CPU, as do other AVG input types,
+/// which still require optimized cuDF MEAN.
 class CudfWindow : public CudfOperatorBase {
  public:
   CudfWindow(
@@ -143,10 +144,11 @@ class CudfWindow : public CudfOperatorBase {
       rmm::cuda_stream_view stream,
       rmm::device_async_resource_ref mr) const;
 
-  // Computes partition-wide REAL/DOUBLE AVG from fully unbounded SUM and
-  // non-null COUNT. cuDF expands partition results to input rows. REAL input
-  // is widened to FLOAT64 before SUM.
-  std::unique_ptr<cudf::column> computeFloatingAverageColumn(
+  // Computes partition-wide REAL/DOUBLE/DECIMAL AVG from fully unbounded SUM
+  // and non-null COUNT. cuDF expands partition results to input rows. REAL
+  // input is widened to FLOAT64 before SUM; DECIMAL64 is widened to DECIMAL128.
+  // Requires a fully unbounded frame; ORDER BY keys are irrelevant there.
+  std::unique_ptr<cudf::column> computePartitionWideAverageColumn(
       const cudf::table_view& partitionKeys,
       cudf::column_view inputColumn,
       const core::WindowNode::Function& function,

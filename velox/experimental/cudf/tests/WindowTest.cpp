@@ -2092,28 +2092,88 @@ TEST_F(CudfWindowTest, customComparisonWindowKeysFallback) {
   }
 }
 
-TEST_F(CudfWindowTest, orderedFullPartitionAverageFallsBack) {
-  auto data = makeRowVector(
-      {"p", "ord", "v"},
-      {
-          makeFlatVector<int32_t>({1, 1, 1, 2, 2}),
-          makeFlatVector<int32_t>({1, 2, 3, 1, 2}),
-          makeNullableFlatVector<double>({10.0, std::nullopt, 30.0, 5.0, 15.0}),
-      });
+TEST_F(CudfWindowTest, orderedFullPartitionAverage) {
+  // A fully unbounded frame spans the whole partition, so ORDER BY does not
+  // change the average and the SUM/COUNT path stays on GPU.
+  const auto assertOrderedAverages =
+      [&](const RowVectorPtr& data,
+          const RowVectorPtr& partitionedExpected,
+          const RowVectorPtr& globalExpected) {
+        const std::vector<std::string> partitionedExpressions = {
+            "avg(v) over (partition by p order by ord rows between "
+            "unbounded preceding and unbounded following) as a",
+            "avg(v) over (partition by p order by ord range between "
+            "unbounded preceding and unbounded following) as a",
+        };
+        for (const auto& expression : partitionedExpressions) {
+          SCOPED_TRACE(expression);
+          auto plan =
+              PlanBuilder().values({data}).window({expression}).planNode();
+          AssertQueryBuilder(plan).assertResults(partitionedExpected);
+        }
 
-  auto plan = PlanBuilder()
-                  .values({data})
-                  .window({"avg(v) over (partition by p order by ord "
-                           "rows between unbounded preceding and unbounded "
-                           "following) as a"})
-                  .planNode();
+        const std::vector<std::string> globalExpressions = {
+            "avg(v) over (order by ord rows between "
+            "unbounded preceding and unbounded following) as a",
+            "avg(v) over (order by ord range between "
+            "unbounded preceding and unbounded following) as a",
+        };
+        for (const auto& expression : globalExpressions) {
+          SCOPED_TRACE(expression);
+          auto plan =
+              PlanBuilder().values({data}).window({expression}).planNode();
+          AssertQueryBuilder(plan).assertResults(globalExpected);
+        }
+      };
 
-  VELOX_ASSERT_THROW(
-      AssertQueryBuilder(plan).copyResults(pool()),
-      "Replacement with cuDF operator failed");
+  {
+    SCOPED_TRACE("double input");
+    auto partitions = makeFlatVector<int32_t>({1, 1, 1, 2, 2});
+    auto ords = makeFlatVector<int32_t>({1, 2, 3, 1, 2});
+    auto values =
+        makeNullableFlatVector<double>({10.0, std::nullopt, 30.0, 5.0, 15.0});
+    assertOrderedAverages(
+        makeRowVector({"p", "ord", "v"}, {partitions, ords, values}),
+        makeRowVector(
+            {"p", "ord", "v", "a"},
+            {partitions,
+             ords,
+             values,
+             makeFlatVector<double>({20.0, 20.0, 20.0, 10.0, 10.0})}),
+        makeRowVector(
+            {"p", "ord", "v", "a"},
+            {partitions,
+             ords,
+             values,
+             makeFlatVector<double>({15.0, 15.0, 15.0, 15.0, 15.0})}));
+  }
+
+  {
+    SCOPED_TRACE("decimal64 input");
+    auto partitions = makeFlatVector<int32_t>({1, 1, 1, 2, 2});
+    auto ords = makeFlatVector<int32_t>({1, 2, 3, 1, 2});
+    auto values = makeNullableFlatVector<int64_t>(
+        {100, std::nullopt, 300, 50, 150}, DECIMAL(12, 2));
+    assertOrderedAverages(
+        makeRowVector({"p", "ord", "v"}, {partitions, ords, values}),
+        makeRowVector(
+            {"p", "ord", "v", "a"},
+            {partitions,
+             ords,
+             values,
+             makeFlatVector<int64_t>(
+                 {200, 200, 200, 100, 100}, DECIMAL(12, 2))}),
+        makeRowVector(
+            {"p", "ord", "v", "a"},
+            {partitions,
+             ords,
+             values,
+             makeFlatVector<int64_t>(
+                 {150, 150, 150, 150, 150}, DECIMAL(12, 2))}));
+  }
 }
 
-TEST_F(CudfWindowTest, floatingAveragePartitionWide) {
+TEST_F(CudfWindowTest, partitionWideAverage) {
   {
     SCOPED_TRACE("double, implicit and explicit full frames");
     auto data = makeRowVector(
@@ -2169,7 +2229,7 @@ TEST_F(CudfWindowTest, floatingAveragePartitionWide) {
   }
 
   {
-    SCOPED_TRACE("real input, double result");
+    SCOPED_TRACE("real input, real result (Presto AVG(REAL) -> REAL)");
     auto data = makeRowVector(
         {"p", "v"},
         {
@@ -2181,7 +2241,7 @@ TEST_F(CudfWindowTest, floatingAveragePartitionWide) {
         {
             makeFlatVector<int32_t>({1, 1, 2, 2}),
             makeFlatVector<float>({10.0F, 30.0F, 5.0F, 15.0F}),
-            makeFlatVector<double>({20.0, 20.0, 10.0, 10.0}),
+            makeFlatVector<float>({20.0F, 20.0F, 10.0F, 10.0F}),
         });
     auto plan = PlanBuilder()
                     .values({data})
@@ -2204,6 +2264,113 @@ TEST_F(CudfWindowTest, floatingAveragePartitionWide) {
             makeNullableFlatVector<int32_t>({std::nullopt, std::nullopt, 1, 1}),
             makeFlatVector<double>({10.0, 30.0, 4.0, 6.0}),
             makeFlatVector<double>({20.0, 20.0, 5.0, 5.0}),
+        });
+    auto plan = PlanBuilder()
+                    .values({data})
+                    .window({"avg(v) over (partition by p) as a"})
+                    .planNode();
+    AssertQueryBuilder(plan).assertResults(expected);
+  }
+
+  {
+    SCOPED_TRACE("decimal64, implicit and explicit full frames");
+    auto data = makeRowVector(
+        {"p", "ord", "v"},
+        {
+            makeFlatVector<int32_t>({1, 1, 1, 2, 2, 3, 3}),
+            makeFlatVector<int32_t>({1, 2, 3, 1, 2, 1, 2}),
+            makeNullableFlatVector<int64_t>(
+                {100, std::nullopt, 300, 50, 150, std::nullopt, std::nullopt},
+                DECIMAL(12, 2)),
+        });
+
+    auto partitionedExpected = makeRowVector(
+        {"p", "ord", "v", "a"},
+        {
+            makeFlatVector<int32_t>({1, 1, 1, 2, 2, 3, 3}),
+            makeFlatVector<int32_t>({1, 2, 3, 1, 2, 1, 2}),
+            makeNullableFlatVector<int64_t>(
+                {100, std::nullopt, 300, 50, 150, std::nullopt, std::nullopt},
+                DECIMAL(12, 2)),
+            makeNullableFlatVector<int64_t>(
+                {200, 200, 200, 100, 100, std::nullopt, std::nullopt},
+                DECIMAL(12, 2)),
+        });
+    const std::vector<std::string> partitionedExpressions = {
+        "avg(v) over (partition by p) as a",
+        "avg(v) over (partition by p "
+        "rows between unbounded preceding and unbounded following) as a",
+    };
+    for (const auto& expression : partitionedExpressions) {
+      SCOPED_TRACE(expression);
+      auto plan = PlanBuilder().values({data}).window({expression}).planNode();
+      AssertQueryBuilder(plan).assertResults(partitionedExpected);
+    }
+
+    auto globalExpected = makeRowVector(
+        {"p", "ord", "v", "a"},
+        {
+            makeFlatVector<int32_t>({1, 1, 1, 2, 2, 3, 3}),
+            makeFlatVector<int32_t>({1, 2, 3, 1, 2, 1, 2}),
+            makeNullableFlatVector<int64_t>(
+                {100, std::nullopt, 300, 50, 150, std::nullopt, std::nullopt},
+                DECIMAL(12, 2)),
+            makeFlatVector<int64_t>(
+                {150, 150, 150, 150, 150, 150, 150}, DECIMAL(12, 2)),
+        });
+    const std::vector<std::string> globalExpressions = {
+        "avg(v) over () as a",
+        "avg(v) over (rows between unbounded preceding "
+        "and unbounded following) as a",
+    };
+    for (const auto& expression : globalExpressions) {
+      SCOPED_TRACE(expression);
+      auto plan = PlanBuilder().values({data}).window({expression}).planNode();
+      AssertQueryBuilder(plan).assertResults(globalExpected);
+    }
+  }
+
+  {
+    SCOPED_TRACE("decimal64 rounds half up");
+    auto data = makeRowVector(
+        {"p", "v"},
+        {
+            makeFlatVector<int32_t>({1, 1, 1, 1, 1, 1, 1}),
+            makeFlatVector<int64_t>(
+                {100, 10, 10, 10, 10, 10, 10}, DECIMAL(12, 2)),
+        });
+    auto expected = makeRowVector(
+        {"p", "v", "a"},
+        {
+            makeFlatVector<int32_t>({1, 1, 1, 1, 1, 1, 1}),
+            makeFlatVector<int64_t>(
+                {100, 10, 10, 10, 10, 10, 10}, DECIMAL(12, 2)),
+            makeFlatVector<int64_t>(
+                {23, 23, 23, 23, 23, 23, 23}, DECIMAL(12, 2)),
+        });
+    auto plan = PlanBuilder()
+                    .values({data})
+                    .window({"avg(v) over (partition by p) as a"})
+                    .planNode();
+    AssertQueryBuilder(plan).assertResults(expected);
+  }
+
+  {
+    SCOPED_TRACE("decimal128");
+    auto data = makeRowVector(
+        {"p", "v"},
+        {
+            makeFlatVector<int32_t>({1, 1, 2, 2}),
+            makeFlatVector<int128_t>(
+                {100, 300, 50, 150}, DECIMAL(38, 2)),
+        });
+    auto expected = makeRowVector(
+        {"p", "v", "a"},
+        {
+            makeFlatVector<int32_t>({1, 1, 2, 2}),
+            makeFlatVector<int128_t>(
+                {100, 300, 50, 150}, DECIMAL(38, 2)),
+            makeFlatVector<int128_t>({200, 200, 100, 100}, DECIMAL(38, 2)),
         });
     auto plan = PlanBuilder()
                     .values({data})

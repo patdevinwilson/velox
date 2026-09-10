@@ -293,6 +293,13 @@ class CudfHiveDataSink : public DataSink {
 
   void appendData(RowVectorPtr input) override;
 
+  /// Writes an already-resident cuDF table without a GPU-to-host-to-GPU
+  /// round trip. The caller must keep the table alive through this call.
+  void appendCudfData(
+      cudf::table_view input,
+      rmm::cuda_stream_view stream,
+      uint64_t inputSizeInBytes);
+
   bool finish() override;
 
   Stats stats() const override;

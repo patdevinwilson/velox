@@ -175,6 +175,21 @@ void CudfHiveDataSink::appendData(RowVectorPtr input) {
   writerInfo_->numWrittenRows += input->size();
 }
 
+void CudfHiveDataSink::appendCudfData(
+    cudf::table_view input,
+    rmm::cuda_stream_view stream,
+    uint64_t inputSizeInBytes) {
+  checkRunning();
+
+  if (writer_ == nullptr) {
+    writer_ = createCudfWriter(input, stream);
+  }
+
+  writer_->write(input);
+  writerInfo_->inputSizeInBytes += inputSizeInBytes;
+  writerInfo_->numWrittenRows += input.num_rows();
+}
+
 std::unique_ptr<cudf::io::chunked_parquet_writer>
 CudfHiveDataSink::createCudfWriter(
     cudf::table_view cudfTable,

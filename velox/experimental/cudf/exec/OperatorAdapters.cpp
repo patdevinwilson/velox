@@ -16,6 +16,7 @@
 
 #include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveConnector.h"
+#include "velox/experimental/cudf/connectors/hive/CudfHiveDataSink.h"
 #include "velox/experimental/cudf/connectors/hive/iceberg/CudfIcebergConnector.h"
 #include "velox/experimental/cudf/exec/CudfAggregation.h"
 #include "velox/experimental/cudf/exec/CudfAssignUniqueId.h"
@@ -32,6 +33,7 @@
 #include "velox/experimental/cudf/exec/CudfNestedLoopJoin.h"
 #include "velox/experimental/cudf/exec/CudfOrderBy.h"
 #include "velox/experimental/cudf/exec/CudfReduce.h"
+#include "velox/experimental/cudf/exec/CudfTableWriter.h"
 #include "velox/experimental/cudf/exec/CudfTopN.h"
 #include "velox/experimental/cudf/exec/CudfWindow.h"
 #include "velox/experimental/cudf/exec/OperatorAdapters.h"
@@ -58,6 +60,7 @@
 #include "velox/exec/SpatialJoinProbe.h"
 #include "velox/exec/StreamingAggregation.h"
 #include "velox/exec/TableScan.h"
+#include "velox/exec/TableWriter.h"
 #include "velox/exec/Task.h"
 #include "velox/exec/TopN.h"
 #include "velox/exec/Values.h"
@@ -1112,6 +1115,53 @@ class EnforceSingleRowAdapter : public OperatorAdapter {
   }
 };
 
+/// TableWriteAdapter - Keeps temporary-table writes on GPU when the target is
+/// the cuDF Hive connector. CTE writes do not carry NOT NULL constraints or
+/// column-statistics aggregations.
+class TableWriteAdapter : public OperatorAdapter {
+ public:
+  TableWriteAdapter() : OperatorAdapter("TableWrite") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const exec::TableWriter*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /* op */,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* /* ctx */) const override {
+    auto node = std::dynamic_pointer_cast<const core::TableWriteNode>(planNode);
+    if (!node || node->hasColumnStatsSpec()) {
+      return false;
+    }
+    return std::dynamic_pointer_cast<
+               const connector::hive::CudfHiveInsertTableHandle>(
+               node->insertTableHandle()->connectorInsertTableHandle()) !=
+        nullptr;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return false;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /* op */,
+      const core::PlanNodePtr& planNode,
+      exec::DriverCtx* ctx,
+      int32_t operatorId) const override {
+    auto node = std::dynamic_pointer_cast<const core::TableWriteNode>(planNode);
+    VELOX_CHECK_NOT_NULL(node);
+    std::vector<std::unique_ptr<exec::Operator>> result;
+    result.push_back(
+        std::make_unique<CudfTableWriter>(operatorId, ctx, std::move(node)));
+    return result;
+  }
+};
+
 /// CallbackSinkAdapter - Keeps original operator
 class CallbackSinkAdapter : public OperatorAdapter {
  public:
@@ -1270,6 +1320,7 @@ void registerAllOperatorAdapters() {
   registry.registerAdapter(std::make_unique<AssignUniqueIdAdapter>());
   registry.registerAdapter(std::make_unique<MarkDistinctAdapter>());
   registry.registerAdapter(std::make_unique<EnforceSingleRowAdapter>());
+  registry.registerAdapter(std::make_unique<TableWriteAdapter>());
   registry.registerAdapter(std::make_unique<GroupIdAdapter>());
   registry.registerAdapter(std::make_unique<ValuesAdapter>());
   registry.registerAdapter(std::make_unique<CallbackSinkAdapter>());

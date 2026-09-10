@@ -31,6 +31,7 @@ add_library(
   CudfNestedLoopJoin.cpp
   CudfOrderBy.cpp
   CudfReduce.cpp
+  CudfTableWriter.cpp
   CudfTopN.cpp
   CudfWindow.cpp
   DebugUtil.cpp

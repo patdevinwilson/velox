@@ -619,10 +619,22 @@ TEST_F(BasicTableWriteTest, roundTrip) {
                   .addNode(cudfTableWrite(targetDirectoryPath->getPath()))
                   .planNode();
 
+  std::shared_ptr<facebook::velox::exec::Task> task;
   auto results =
       AssertQueryBuilder(plan)
           .split(makeCudfHiveConnectorSplit(sourceFilePath->getPath()))
-          .copyResults(pool());
+          .copyResults(pool(), task);
+  bool usedCudfTableWrite = false;
+  bool usedCpuTableWrite = false;
+  for (const auto& pipelineStats : task->taskStats().pipelineStats) {
+    for (const auto& operatorStats : pipelineStats.operatorStats) {
+      usedCudfTableWrite |=
+          operatorStats.operatorType == "CudfTableWrite";
+      usedCpuTableWrite |= operatorStats.operatorType == "TableWrite";
+    }
+  }
+  ASSERT_TRUE(usedCudfTableWrite);
+  ASSERT_FALSE(usedCpuTableWrite);
   ASSERT_EQ(2, results->size());
 
   // First column has number of rows written in the first row and nulls in other
@@ -638,7 +650,7 @@ TEST_F(BasicTableWriteTest, roundTrip) {
                      ->as<FlatVector<StringView>>();
   ASSERT_TRUE(details->isNullAt(0));
   ASSERT_FALSE(details->isNullAt(1));
-  folly::dynamic obj = folly::parseJson(details->valueAt(1));
+  folly::dynamic obj = folly::parseJson(details->valueAt(1).str());
 
   ASSERT_EQ(size, obj["rowCount"].asInt());
   auto fileWriteInfos = obj["fileWriteInfos"];
@@ -679,7 +691,7 @@ TEST_F(BasicTableWriteTest, targetFileName) {
   auto results = AssertQueryBuilder(plan).copyResults(pool());
   auto* details = results->childAt(TableWriteTraits::kFragmentChannel)
                       ->asUnchecked<SimpleVector<StringView>>();
-  auto detail = folly::parseJson(details->valueAt(1));
+  auto detail = folly::parseJson(details->valueAt(1).str());
   auto fileWriteInfos = detail["fileWriteInfos"];
   ASSERT_EQ(1, fileWriteInfos.size());
   ASSERT_EQ(fileWriteInfos[0]["writeFileName"].asString(), kFileName);

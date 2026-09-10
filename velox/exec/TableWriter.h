@@ -21,6 +21,7 @@
 #include "velox/exec/ColumnStatsCollector.h"
 #include "velox/exec/MemoryReclaimer.h"
 #include "velox/exec/Operator.h"
+#include "velox/exec/OperatorType.h"
 
 namespace facebook::velox::exec {
 
@@ -29,7 +30,8 @@ class TableWriter : public Operator {
   TableWriter(
       int32_t operatorId,
       DriverCtx* driverCtx,
-      const core::TableWriteNodePtr& tableWriteNode);
+      const core::TableWriteNodePtr& tableWriteNode,
+      std::string_view operatorTypeName = OperatorType::kTableWrite);
 
   BlockingReason isBlocked(ContinueFuture* future) override;
 
@@ -87,6 +89,17 @@ class TableWriter : public Operator {
   /// The walltime spent on file write data compression.
   static constexpr std::string_view kWriteCompressionTime{
       "writeCompressionWallNanos"};
+
+ protected:
+  /// Gives specialized writers a zero-copy path before TableWriter projects
+  /// RowVector children. Returns true when the input was appended.
+  virtual bool tryAppendInput(const RowVectorPtr& /* input */) {
+    return false;
+  }
+
+  connector::DataSink* dataSink() const {
+    return dataSink_.get();
+  }
 
  private:
   // The memory reclaimer customized for connector which interface with the

@@ -24,17 +24,18 @@ namespace facebook::velox::exec {
 TableWriter::TableWriter(
     int32_t operatorId,
     DriverCtx* driverCtx,
-    const core::TableWriteNodePtr& tableWriteNode)
+    const core::TableWriteNodePtr& tableWriteNode,
+    std::string_view operatorTypeName)
     : Operator(
           driverCtx,
           tableWriteNode->outputType(),
           operatorId,
           tableWriteNode->id(),
-          OperatorType::kTableWrite,
+          operatorTypeName,
           tableWriteNode->canSpill(driverCtx->queryConfig())
               ? driverCtx->makeSpillConfig(
                     operatorId,
-                    OperatorType::kTableWrite)
+                    operatorTypeName)
               : std::nullopt),
       driverCtx_(driverCtx),
       connectorPool_(driverCtx_->task->addConnectorPoolLocked(
@@ -145,6 +146,15 @@ bool TableWriter::finishDataSink() {
 
 void TableWriter::addInput(RowVectorPtr input) {
   if (input->size() == 0) {
+    return;
+  }
+
+  if (tryAppendInput(input)) {
+    numWrittenRows_ += input->size();
+    updateStats(dataSink_->stats());
+    VELOX_CHECK_NULL(
+        statsCollector_,
+        "Specialized table writer input does not support column statistics");
     return;
   }
 

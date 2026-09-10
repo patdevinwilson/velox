@@ -16,6 +16,8 @@
 
 #pragma once
 
+#include <cstdint>
+
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
 
@@ -52,5 +54,10 @@ void unregisterCudf();
 
 /// Returns true if cuDF is registered.
 bool cudfIsRegistered();
+
+/// Starts and stops the UCX progress engine used by GPU exchange operators.
+/// No-op when cudf.exchange is disabled.
+void startUcxExchange(uint16_t port);
+void stopUcxExchange();
 
 } // namespace facebook::velox::cudf_velox

@@ -56,6 +56,16 @@ void UcxOutputQueueManager::initializeTask(
   // Clear any stale "removed" state so that getData() calls after this
   // initializeTask() create proper placeholder queues if needed.
   removedTasks_.withLock([&](auto& removed) { removed.erase(taskId); });
+  const auto update = outputBufferUpdates_.withLock(
+      [&](const auto& updates)
+          -> std::optional<std::pair<int, bool>> {
+        auto it = updates.find(taskId);
+        return it == updates.end() ? std::nullopt
+                                   : std::optional{it->second};
+      });
+  if (update) {
+    getQueue(taskId)->updateOutputBuffers(update->first, update->second);
+  }
   // Clear any stale "cancelled" state in the intra-node registry so
   // that the cancelledTasks_ set doesn't grow unboundedly across queries.
   IntraNodeTransferRegistry::getInstance()->clearCancelledTask(taskId);
@@ -65,6 +75,9 @@ bool UcxOutputQueueManager::updateOutputBuffers(
     const std::string& taskId,
     int numBuffers,
     bool noMoreBuffers) {
+  outputBufferUpdates_.withLock([&](auto& updates) {
+    updates[taskId] = {numBuffers, noMoreBuffers};
+  });
   if (auto queue = getQueueIfExists(taskId)) {
     queue->updateOutputBuffers(numBuffers, noMoreBuffers);
     return true;
@@ -92,6 +105,16 @@ void UcxOutputQueueManager::noMoreData(std::string_view taskId) {
 
 bool UcxOutputQueueManager::isFinished(std::string_view taskId) {
   return getQueue(taskId)->isFinished();
+}
+
+size_t UcxOutputQueueManager::numDestinations(std::string_view taskId) {
+  return getQueue(taskId)->numDestinations();
+}
+
+void UcxOutputQueueManager::producerClosed(std::string_view taskId) {
+  if (auto queue = getQueueIfExists(taskId); queue && queue->producerClosed()) {
+    removeTask(std::string{taskId});
+  }
 }
 
 void UcxOutputQueueManager::deleteResults(
@@ -153,6 +176,8 @@ bool UcxOutputQueueManager::canUseIntraNode(std::string_view taskId) {
 
 void UcxOutputQueueManager::removeTask(const std::string& taskId) {
   std::string taskIdStr{taskId};
+  outputBufferUpdates_.withLock(
+      [&](auto& updates) { updates.erase(taskIdStr); });
   auto queue =
       queues_.withLock([&](auto& queues) -> std::shared_ptr<UcxOutputQueue> {
         auto it = queues.find(taskIdStr);

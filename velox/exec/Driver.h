@@ -37,6 +37,7 @@ namespace facebook::velox::exec {
 
 class Driver;
 class ExchangeClient;
+class ExchangeClientHandle;
 class Operator;
 struct OperatorStats;
 class Task;
@@ -826,7 +827,7 @@ struct DriverFactory {
 
   std::shared_ptr<Driver> createDriver(
       std::unique_ptr<DriverCtx> ctx,
-      std::shared_ptr<ExchangeClient> exchangeClient,
+      std::shared_ptr<ExchangeClientHandle> exchangeClient,
       std::shared_ptr<PipelinePushdownFilters> filters,
       std::function<int(int pipelineId)> numDrivers);
 

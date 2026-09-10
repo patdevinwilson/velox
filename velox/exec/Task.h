@@ -21,6 +21,7 @@
 #include "velox/core/PlanFragment.h"
 #include "velox/core/QueryCtx.h"
 #include "velox/exec/Driver.h"
+#include "velox/exec/ExchangeTransportRegistry.h"
 #include "velox/exec/LocalPartition.h"
 #include "velox/exec/MemoryReclaimer.h"
 #include "velox/exec/MergeSource.h"
@@ -1184,10 +1185,13 @@ class Task : public std::enable_shared_from_this<Task> {
   std::shared_ptr<ExchangeClient> getExchangeClientLocked(
       const core::PlanNodeId& planNodeId) const;
 
-  // Get a shared reference to the exchange client with the specified
-  // 'pipelineId'. The function returns null if there is no client created for
-  // 'pipelineId' set in 'exchangeClients_'.
   std::shared_ptr<ExchangeClient> getExchangeClientLocked(
+      int32_t pipelineId) const;
+
+  std::shared_ptr<ExchangeClientHandle> getExchangeHandleLocked(
+      const core::PlanNodeId& planNodeId) const;
+
+  std::shared_ptr<ExchangeClientHandle> getExchangeHandleLocked(
       int32_t pipelineId) const;
 
   // Builds the query trace config.
@@ -1297,10 +1301,17 @@ class Task : public std::enable_shared_from_this<Task> {
   // node ID.
   std::vector<std::shared_ptr<ExchangeClient>> exchangeClients_;
 
+  std::vector<std::shared_ptr<ExchangeClientHandle>> exchangeHandles_;
+
   // Exchange clients keyed by the corresponding Exchange plan node ID. Used to
   // process remaining remote splits after the task has completed early.
   std::unordered_map<core::PlanNodeId, std::shared_ptr<ExchangeClient>>
       exchangeClientByPlanNode_;
+
+  std::unordered_map<core::PlanNodeId, std::shared_ptr<ExchangeClientHandle>>
+      exchangeHandleByPlanNode_;
+
+  std::string outputTransportKind_{core::TransportKind::kHttp};
 
   // Pool of unique row ids shared by all AssignUniqueId operators in this task.
   // See uniqueRowIdPool().
@@ -1567,6 +1578,13 @@ bool registerTaskListener(std::shared_ptr<TaskListener> listener);
 /// Unregister a listener registered earlier. Returns true if listener was
 /// unregistered successfuly, false if listener was not found.
 bool unregisterTaskListener(const std::shared_ptr<TaskListener>& listener);
+
+using OutputBuffersUpdateHook =
+    std::function<void(const std::string&, int, bool)>;
+
+/// Installs a process-wide observer for coordinator output-buffer updates.
+/// Experimental transports use this to mirror dynamic broadcast destinations.
+void setOutputBuffersUpdateHook(OutputBuffersUpdateHook hook);
 
 /// Listener invoked when splits are added to Task.
 class SplitListener {

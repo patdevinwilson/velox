@@ -54,6 +54,10 @@ class OperatorAdapter {
   /// can accept GPU vectors as input.
   virtual bool acceptsGpuInput() const = 0;
 
+  virtual bool acceptsGpuInput(const core::PlanNodePtr& /*planNode*/) const {
+    return acceptsGpuInput();
+  }
+
   /// Check if this operator produces GPU output. Returns true if the operator
   /// produces GPU vectors as output.
   virtual bool producesGpuOutput() const = 0;
@@ -73,7 +77,8 @@ class OperatorAdapter {
       exec::DriverCtx* ctx) const {
     Properties props;
     props.canRunOnGPU = canRunOnGPU(op, planNode, ctx);
-    props.acceptsGpuInput = props.canRunOnGPU && acceptsGpuInput();
+    props.acceptsGpuInput =
+        props.canRunOnGPU && acceptsGpuInput(planNode);
     props.producesGpuOutput = props.canRunOnGPU && producesGpuOutput();
     return props;
   }

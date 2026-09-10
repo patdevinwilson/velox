@@ -61,6 +61,8 @@ class UcxPartitionedOutput : public exec::Operator,
   // drained ?
   bool isFinished() override;
 
+  void close() override;
+
  private:
   std::shared_ptr<facebook::velox::ucx_exchange::UcxOutputQueueManager>
   sharedQueueManager();
@@ -89,7 +91,8 @@ class UcxPartitionedOutput : public exec::Operator,
 
   const std::weak_ptr<UcxOutputQueueManager> queueManager_;
   std::vector<column_index_t> partitionKeyIndices_;
-  const size_t numPartitions_;
+  size_t numPartitions_;
+  const core::PartitionedOutputNode::Kind kind_;
 
   const int pipelineId_;
   const int driverId_;
@@ -98,6 +101,7 @@ class UcxPartitionedOutput : public exec::Operator,
   ContinueFuture future_;
 
   bool finished_{false};
+  bool closed_{false};
   std::string spec_;
 
   // Used for switching columns when column order differs between input and
@@ -111,7 +115,7 @@ class UcxPartitionedOutput : public exec::Operator,
   std::vector<cudf_velox::CudfVectorPtr> pendingInputs_;
   /// Total rows across pendingInputs_.
   int64_t pendingRows_{0};
-  /// Configured row threshold for flushing (from QueryConfig).
+  /// Configured row threshold for flushing.
   const int64_t targetRowsPerChunk_;
 };
 

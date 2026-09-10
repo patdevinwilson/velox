@@ -18,6 +18,7 @@
 #include <boost/lexical_cast.hpp>
 #include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
+#include <mutex>
 #include <string>
 
 #include "velox/common/base/Counters.h"
@@ -29,6 +30,8 @@
 #include "velox/common/time/Timer.h"
 #include "velox/exec/DefaultOutputBufferManager.h"
 #include "velox/exec/Exchange.h"
+#include "velox/exec/ExchangeTransportRegistry.h"
+#include "velox/exec/OutputTransportRegistry.h"
 #include "velox/exec/HashJoinBridge.h"
 #include "velox/exec/IndexLookupJoinBridge.h"
 #include "velox/exec/LocalPlanner.h"
@@ -46,6 +49,9 @@ using facebook::velox::common::testutil::TestValue;
 
 namespace facebook::velox::exec {
 namespace {
+
+std::mutex outputBuffersUpdateHookMutex;
+OutputBuffersUpdateHook outputBuffersUpdateHook;
 
 // RAII helper class to satisfy given promises and notify listeners of an event
 // connected to the promises outside of the mutex that guards the promises.
@@ -280,6 +286,11 @@ void noMoreSplitsForStore(
 
 } // namespace
 
+void setOutputBuffersUpdateHook(OutputBuffersUpdateHook hook) {
+  std::lock_guard<std::mutex> lock(outputBuffersUpdateHookMutex);
+  outputBuffersUpdateHook = std::move(hook);
+}
+
 std::string executionModeString(Task::ExecutionMode mode) {
   switch (mode) {
     case Task::ExecutionMode::kSerial:
@@ -441,6 +452,14 @@ Task::Task(
       splitsStates_(buildSplitStates(planFragment_.planNode)),
       bufferManager_(DefaultOutputBufferManager::getInstanceRef()) {
   ++numCreatedTasks_;
+  OutputTransportRegistry::registerHttpDefaults();
+  ExchangeTransportRegistry::registerHttpDefaults();
+  if (auto partitionedOutput =
+          std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
+              planFragment_.planNode)) {
+    outputTransportKind_ =
+        outputTransportKind(planFragment_, partitionedOutput->id());
+  }
   // Validate that any per-node transport type annotations refer to the right
   // kind of plan node before they are used to select exchange transports.
   planFragment_.validateTransportTypes();
@@ -1282,11 +1301,6 @@ void Task::initializePartitionOutput() {
       taskId_,
       errorMessageLocked());
 
-  auto bufferManager = bufferManager_.lock();
-  VELOX_CHECK_NOT_NULL(
-      bufferManager,
-      "Unable to initialize task. "
-      "PartitionedOutputBufferManager was already destructed");
   std::shared_ptr<const core::PartitionedOutputNode> partitionedOutputNode{
       nullptr};
   int numOutputDrivers{0};
@@ -1294,6 +1308,7 @@ void Task::initializePartitionOutput() {
     std::unique_lock<std::timed_mutex> l(mutex_);
     const auto numPipelines = driverFactories_.size();
     exchangeClients_.resize(numPipelines);
+    exchangeHandles_.resize(numPipelines);
 
     // In this loop we prepare the global state of pipelines: partitioned
     // output buffer and exchange client(s).
@@ -1330,7 +1345,7 @@ void Task::initializePartitionOutput() {
   if (partitionedOutputNode != nullptr) {
     VELOX_CHECK(hasPartitionedOutput());
     VELOX_CHECK_GT(numOutputDrivers, 0);
-    bufferManager->initializeTask(
+    OutputTransportRegistry::get(outputTransportKind_).initializeTask(
         shared_from_this(),
         partitionedOutputNode->kind(),
         partitionedOutputNode->numPartitions(),
@@ -1530,7 +1545,7 @@ std::vector<std::shared_ptr<Driver>> Task::createDriversLocked(
               pipeline,
               splitGroupId,
               partitionId),
-          getExchangeClientLocked(pipeline),
+          getExchangeHandleLocked(pipeline),
           filters,
           [self](size_t i) {
             return i < self->driverFactories_.size()
@@ -1767,11 +1782,11 @@ void Task::addRemoteSplit(
     const core::PlanNodeId& planNodeId,
     const exec::Split& split) {
   if (split.hasConnectorSplit()) {
-    if (exchangeClientByPlanNode_.count(planNodeId)) {
+    if (exchangeHandleByPlanNode_.count(planNodeId)) {
       auto remoteSplit =
           std::dynamic_pointer_cast<RemoteConnectorSplit>(split.connectorSplit);
       VELOX_CHECK(remoteSplit, "Wrong type of split");
-      exchangeClientByPlanNode_[planNodeId]->addRemoteTaskId(
+      exchangeHandleByPlanNode_[planNodeId]->addRemoteTaskId(
           remoteSplit->taskId);
     }
   }
@@ -2136,8 +2151,15 @@ bool Task::checkNoMoreSplitGroupsLocked() {
         numDriversUngrouped_;
     if (groupedPartitionedOutput_) {
       auto bufferManager = bufferManager_.lock();
-      bufferManager->updateNumDrivers(
-          taskId(), numDriversInPartitionedOutput_ * seenSplitGroups_.size());
+      if (outputTransportKind_ == core::TransportKind::kHttp) {
+        bufferManager->updateNumDrivers(
+            taskId(),
+            numDriversInPartitionedOutput_ * seenSplitGroups_.size());
+      } else {
+        OutputTransportRegistry::get(outputTransportKind_).updateNumDrivers(
+            taskId(),
+            numDriversInPartitionedOutput_ * seenSplitGroups_.size());
+      }
     }
 
     return checkIfFinishedLocked();
@@ -2353,7 +2375,18 @@ bool Task::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
       noMoreOutputBuffers_ = true;
     }
   }
-  return bufferManager->updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
+  const auto updated =
+      OutputTransportRegistry::get(outputTransportKind_)
+          .updateOutputBuffers(taskId_, numBuffers, noMoreBuffers);
+  OutputBuffersUpdateHook hook;
+  {
+    std::lock_guard<std::mutex> lock(outputBuffersUpdateHookMutex);
+    hook = outputBuffersUpdateHook;
+  }
+  if (hook) {
+    hook(taskId_, numBuffers, noMoreBuffers);
+  }
+  return updated;
 }
 
 int Task::getOutputPipelineId() const {
@@ -2657,6 +2690,7 @@ ContinueFuture Task::terminate(TaskState terminalState) {
   EventCompletionNotifier stateChangeNotifier;
   std::vector<ContinuePromise> barrierPromises;
   std::vector<std::shared_ptr<ExchangeClient>> exchangeClients;
+  std::vector<std::shared_ptr<ExchangeClientHandle>> exchangeHandles;
   {
     std::lock_guard<std::timed_mutex> l(mutex_);
     if (taskStats_.executionEndTimeMs == 0) {
@@ -2718,6 +2752,7 @@ ContinueFuture Task::terminate(TaskState terminalState) {
       }
     }
     exchangeClients.swap(exchangeClients_);
+    exchangeHandles.swap(exchangeHandles_);
 
     barrierPromises.swap(barrierFinishPromises_);
     // Clear the barrier flag to ensure underBarrier() returns false after task
@@ -2741,15 +2776,16 @@ ContinueFuture Task::terminate(TaskState terminalState) {
   // typically the last one.
   maybeRemoveFromOutputBufferManager();
 
-  for (auto& exchangeClient : exchangeClients) {
-    if (exchangeClient != nullptr) {
-      exchangeClient->close();
+  for (auto& exchangeHandle : exchangeHandles) {
+    if (exchangeHandle != nullptr) {
+      exchangeHandle->close();
     }
   }
 
   // Release reference to exchange client, so that it will close exchange
   // sources and prevent resending requests for data.
   exchangeClients.clear();
+  exchangeHandles.clear();
 
   std::vector<ContinuePromise> splitPromises;
   std::vector<std::shared_ptr<JoinBridge>> oldBridges;
@@ -2777,7 +2813,7 @@ ContinueFuture Task::terminate(TaskState terminalState) {
       }
 
       // Process remaining remote splits.
-      if (getExchangeClientLocked(nodeId) != nullptr) {
+      if (getExchangeHandleLocked(nodeId) != nullptr) {
         std::vector<exec::Split> splits;
         for (auto& [groupId, store] : state.groupSplitsStores) {
           if (!store) {
@@ -2805,7 +2841,11 @@ ContinueFuture Task::terminate(TaskState terminalState) {
   TestValue::adjust("facebook::velox::exec::Task::terminate", this);
 
   for (auto& [planNodeId, splits] : remainingRemoteSplits) {
-    auto client = getExchangeClient(planNodeId);
+    std::shared_ptr<ExchangeClientHandle> handle;
+    {
+      std::lock_guard<std::timed_mutex> l(mutex_);
+      handle = getExchangeHandleLocked(planNodeId);
+    }
     for (auto& split : splits.first) {
       try {
         addRemoteSplit(planNodeId, split);
@@ -2815,8 +2855,8 @@ ContinueFuture Task::terminate(TaskState terminalState) {
             << ex.what();
       }
     }
-    if (splits.second) {
-      client->noMoreRemoteTasks();
+    if (splits.second && handle) {
+      handle->noMoreRemoteTasks();
     }
   }
 
@@ -2846,16 +2886,14 @@ ContinueFuture Task::terminate(TaskState terminalState) {
 
 void Task::maybeRemoveFromOutputBufferManager() {
   if (hasPartitionedOutput()) {
-    if (auto bufferManager = bufferManager_.lock()) {
-      // Capture output buffer stats before deleting the buffer.
-      {
-        std::lock_guard<std::timed_mutex> l(mutex_);
-        if (!taskStats_.outputBufferStats.has_value()) {
-          taskStats_.outputBufferStats = bufferManager->stats(taskId_);
-        }
+    const auto& transport = OutputTransportRegistry::get(outputTransportKind_);
+    {
+      std::lock_guard<std::timed_mutex> l(mutex_);
+      if (!taskStats_.outputBufferStats.has_value()) {
+        taskStats_.outputBufferStats = transport.stats(taskId_);
       }
-      bufferManager->removeTask(taskId_);
     }
+    transport.removeTask(taskId_);
   }
 }
 
@@ -3013,11 +3051,11 @@ TaskStats Task::taskStats() const {
     }
   }
 
-  auto bufferManager = bufferManager_.lock();
-  taskStats.outputBufferUtilization = bufferManager->getUtilization(taskId_);
-  taskStats.outputBufferOverutilized = bufferManager->isOverutilized(taskId_);
+  const auto& transport = OutputTransportRegistry::get(outputTransportKind_);
+  taskStats.outputBufferUtilization = transport.getUtilization(taskId_);
+  taskStats.outputBufferOverutilized = transport.isOverutilized(taskId_);
   if (!taskStats.outputBufferStats.has_value()) {
-    taskStats.outputBufferStats = bufferManager->stats(taskId_);
+    taskStats.outputBufferStats = transport.stats(taskId_);
   }
   return taskStats;
 }
@@ -3284,7 +3322,7 @@ folly::dynamic Task::toJson() const {
   }
 
   folly::dynamic exchangeClients = folly::dynamic::object;
-  for (const auto& [id, client] : exchangeClientByPlanNode_) {
+  for (const auto& [id, client] : exchangeHandleByPlanNode_) {
     exchangeClients[id] = client->toJson();
   }
   obj["exchangeClientByPlanNode"] = exchangeClients;
@@ -3730,14 +3768,33 @@ void Task::createExchangeClientLocked(
     const core::PlanNodeId& planNodeId,
     int32_t numberOfConsumers) {
   VELOX_CHECK_NULL(
-      getExchangeClientLocked(pipelineId),
+      getExchangeHandleLocked(pipelineId),
       "Exchange client has been created at pipeline: {} for planNode: {}",
       pipelineId,
       planNodeId);
   VELOX_CHECK_NULL(
-      getExchangeClientLocked(planNodeId),
+      getExchangeHandleLocked(planNodeId),
       "Exchange client has been created for planNode: {}",
       planNodeId);
+  const auto kind = inputTransportKind(planFragment_, planNodeId);
+  if (kind != core::TransportKind::kHttp) {
+    const auto& entry = ExchangeTransportRegistry::get(kind);
+    VELOX_USER_CHECK(
+        entry.createClient,
+        "Transport {} does not provide an exchange client factory",
+        kind);
+    auto handle = entry.createClient(
+        taskId_,
+        destination_,
+        numberOfConsumers,
+        this,
+        planNodeId,
+        pipelineId);
+    VELOX_CHECK_NOT_NULL(handle);
+    exchangeHandles_[pipelineId] = handle;
+    exchangeHandleByPlanNode_.emplace(planNodeId, std::move(handle));
+    return;
+  }
   // Low-water mark for filling the exchange queue is 1/2 of the per worker
   // buffer size of the producers.
   exchangeClients_[pipelineId] = std::make_shared<ExchangeClient>(
@@ -3752,6 +3809,9 @@ void Task::createExchangeClientLocked(
       queryCtx()->queryConfig().singleSourceExchangeOptimizationEnabled(),
       queryCtx()->queryConfig().exchangeLazyFetchingEnabled());
   exchangeClientByPlanNode_.emplace(planNodeId, exchangeClients_[pipelineId]);
+  exchangeHandles_[pipelineId] =
+      wrapHttpExchangeClient(exchangeClients_[pipelineId]);
+  exchangeHandleByPlanNode_.emplace(planNodeId, exchangeHandles_[pipelineId]);
 }
 
 std::shared_ptr<ExchangeClient> Task::getExchangeClientLocked(
@@ -3767,6 +3827,21 @@ std::shared_ptr<ExchangeClient> Task::getExchangeClientLocked(
     int32_t pipelineId) const {
   VELOX_CHECK_LT(pipelineId, exchangeClients_.size());
   return exchangeClients_[pipelineId];
+}
+
+std::shared_ptr<ExchangeClientHandle> Task::getExchangeHandleLocked(
+    const core::PlanNodeId& planNodeId) const {
+  auto it = exchangeHandleByPlanNode_.find(planNodeId);
+  if (it == exchangeHandleByPlanNode_.end()) {
+    return nullptr;
+  }
+  return it->second;
+}
+
+std::shared_ptr<ExchangeClientHandle> Task::getExchangeHandleLocked(
+    int32_t pipelineId) const {
+  VELOX_CHECK_LT(pipelineId, exchangeHandles_.size());
+  return exchangeHandles_[pipelineId];
 }
 
 std::unique_ptr<trace::TraceCtx> Task::maybeMakeTraceCtx() const {

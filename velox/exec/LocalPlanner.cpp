@@ -21,6 +21,7 @@
 #include "velox/exec/EnforceDistinct.h"
 #include "velox/exec/EnforceSingleRow.h"
 #include "velox/exec/Exchange.h"
+#include "velox/exec/ExchangeTransportRegistry.h"
 #include "velox/exec/Expand.h"
 #include "velox/exec/FilterProject.h"
 #include "velox/exec/GroupId.h"
@@ -38,6 +39,7 @@
 #include "velox/exec/NestedLoopJoinProbe.h"
 #include "velox/exec/OperatorTraceScan.h"
 #include "velox/exec/OrderBy.h"
+#include "velox/exec/OutputTransportRegistry.h"
 #include "velox/exec/ParallelProject.h"
 #include "velox/exec/PartitionedOutput.h"
 #include "velox/exec/RoundRobinPartitionFunction.h"
@@ -477,7 +479,7 @@ void LocalPlanner::markMixedJoinBridges(
 
 std::shared_ptr<Driver> DriverFactory::createDriver(
     std::unique_ptr<DriverCtx> ctx,
-    std::shared_ptr<ExchangeClient> exchangeClient,
+    std::shared_ptr<ExchangeClientHandle> exchangeClient,
     std::shared_ptr<PipelinePushdownFilters> filters,
     std::function<int(int pipelineId)> numDrivers) {
   auto driver = std::shared_ptr<Driver>(new Driver());
@@ -551,18 +553,23 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
     } else if (
         auto exchangeNode =
             std::dynamic_pointer_cast<const core::ExchangeNode>(planNode)) {
-      // NOTE: the exchange client can only be used by one operator in a driver.
       VELOX_CHECK_NOT_NULL(exchangeClient);
-      operators.push_back(
-          std::make_unique<Exchange>(
-              id, ctx.get(), exchangeNode, std::move(exchangeClient)));
+      const auto kind =
+          inputTransportKind(ctx->task->planFragment(), exchangeNode->id());
+      operators.push_back(ExchangeTransportRegistry::get(kind).createOperator(
+          id, ctx.get(), exchangeNode, exchangeClient));
     } else if (
         auto partitionedOutputNode =
             std::dynamic_pointer_cast<const core::PartitionedOutputNode>(
                 planNode)) {
+      const auto kind = outputTransportKind(
+          ctx->task->planFragment(), partitionedOutputNode->id());
       operators.push_back(
-          std::make_unique<PartitionedOutput>(
-              id, ctx.get(), partitionedOutputNode, eagerFlush(*planNode)));
+          OutputTransportRegistry::get(kind).createOperator(
+              id,
+              ctx.get(),
+              partitionedOutputNode,
+              eagerFlush(*planNode)));
     } else if (
         auto joinNode =
             std::dynamic_pointer_cast<const core::HashJoinNode>(planNode)) {
@@ -715,11 +722,13 @@ std::shared_ptr<Driver> DriverFactory::createDriver(
     } else {
       std::unique_ptr<Operator> extended;
       if (planNode->requiresExchangeClient()) {
-        // NOTE: the exchange client can only be used by one operator in a
-        // driver.
         VELOX_CHECK_NOT_NULL(exchangeClient);
+        auto httpClient = exchangeClient->asHttpClient();
+        VELOX_CHECK_NOT_NULL(
+            httpClient,
+            "Extended operators that require an exchange client only support HTTP transport");
         extended = Operator::fromPlanNode(
-            ctx.get(), id, planNode, std::move(exchangeClient));
+            ctx.get(), id, planNode, std::move(httpClient));
       } else {
         extended = Operator::fromPlanNode(ctx.get(), id, planNode);
       }

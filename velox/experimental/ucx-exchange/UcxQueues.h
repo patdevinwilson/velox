@@ -222,6 +222,9 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
   /// @brief Indicates that a driver is done and won't enqueue any more data.
   void noMoreData();
 
+  /// Returns true after all producer operators have closed.
+  bool producerClosed();
+
   /// @brief Updates the number of destination buffers. For broadcast mode,
   /// new destinations are backfilled with previously broadcast data.
   /// Modeled on OutputBuffer::updateOutputBuffers().
@@ -229,6 +232,8 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
 
   /// @brief Returns true if the OutputQueue is finished. Thread-safe.
   bool isFinished();
+
+  size_t numDestinations();
 
   /// @brief Same as isFinished but must only be called when owning the lock.
   bool isFinishedLocked();
@@ -348,6 +353,7 @@ class UcxOutputQueue : public std::enable_shared_from_this<UcxOutputQueue> {
 
   // keep track of the number of drivers that have finished.
   uint32_t numFinished_{0};
+  uint32_t numClosedProducers_{0};
 
   bool atEnd_ = false;
 

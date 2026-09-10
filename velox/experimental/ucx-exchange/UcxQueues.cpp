@@ -338,6 +338,13 @@ void UcxOutputQueue::noMoreData() {
   checkIfDone(true);
 }
 
+bool UcxOutputQueue::producerClosed() {
+  std::lock_guard<std::mutex> l(mutex_);
+  ++numClosedProducers_;
+  VELOX_CHECK_LE(numClosedProducers_, numDrivers_);
+  return numClosedProducers_ == numDrivers_;
+}
+
 void UcxOutputQueue::noMoreDrivers() {
   // Do not increment number of finished drivers.
   checkIfDone(false);
@@ -422,9 +429,16 @@ bool UcxOutputQueue::isFinished() {
   return isFinishedLocked();
 }
 
+size_t UcxOutputQueue::numDestinations() {
+  std::lock_guard<std::mutex> l(mutex_);
+  return queues_.size();
+}
+
 bool UcxOutputQueue::isFinishedLocked() {
-  // For broadcast, we can only be finished after receiving the no more
-  // (destination) buffers signal, matching OutputBuffer::isFinishedLocked().
+  // Broadcast must wait for the coordinator's final destination count because
+  // late destinations require backfill. Arbitrary output does not backfill:
+  // its UCX consumers create their destination queues directly, so it can
+  // finish once every observed destination has consumed end-of-stream.
   if (kind_ == core::PartitionedOutputNode::Kind::kBroadcast &&
       !noMoreQueues_) {
     return false;
@@ -447,23 +461,29 @@ void UcxOutputQueue::updateOutputBuffers(int numBuffers, bool noMoreBuffers) {
     return;
   }
 
-  VELOX_CHECK_EQ(kind_, Kind::kBroadcast);
+  VELOX_CHECK(
+      kind_ == Kind::kBroadcast || kind_ == Kind::kArbitrary,
+      "Unsupported dynamic output kind {}",
+      static_cast<int32_t>(kind_));
   bool isFinished;
   {
     std::lock_guard<std::mutex> l(mutex_);
 
     if (numBuffers > queues_.size()) {
-      // Add new destination queues and backfill with broadcast data.
+      // Add new destination queues. Broadcast backfills data that arrived
+      // before the coordinator published the final buffer count.
       int32_t numNewBuffers = numBuffers - queues_.size();
       queues_.reserve(numBuffers);
       for (int32_t i = 0; i < numNewBuffers; ++i) {
         auto buffer = std::make_unique<UcxDestinationQueue>();
-        for (const auto& [data, numRows] : dataToBroadcast_) {
-          buffer->enqueueBack(data, numRows);
-          // Account for backfilled data in queuedBytes_ so that dequeue
-          // decrements don't drive it negative.
-          queuedBytes_ += data->gpu_data->size();
-          queuedPackedColumns_++;
+        if (kind_ == Kind::kBroadcast) {
+          for (const auto& [data, numRows] : dataToBroadcast_) {
+            buffer->enqueueBack(data, numRows);
+            // Account for backfilled data in queuedBytes_ so that dequeue
+            // decrements don't drive it negative.
+            queuedBytes_ += data->gpu_data->size();
+            queuedPackedColumns_++;
+          }
         }
         if (atEnd_) {
           buffer->enqueueBack(nullptr, /*numRows=*/0);

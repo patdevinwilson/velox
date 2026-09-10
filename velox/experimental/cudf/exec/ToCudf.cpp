@@ -26,6 +26,14 @@
 #include "velox/experimental/cudf/expression/AstExpression.h"
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 #include "velox/experimental/cudf/expression/JitExpression.h"
+#include "velox/experimental/ucx-exchange/Communicator.h"
+#include "velox/experimental/ucx-exchange/UcxExchange.h"
+#include "velox/experimental/ucx-exchange/UcxExchangeClient.h"
+#include "velox/experimental/ucx-exchange/UcxOutputQueueManager.h"
+#include "velox/experimental/ucx-exchange/UcxPartitionedOutput.h"
+#include "velox/exec/ExchangeTransportRegistry.h"
+#include "velox/exec/OutputTransportRegistry.h"
+#include "velox/exec/Task.h"
 
 #include "folly/Conv.h"
 
@@ -34,11 +42,128 @@
 
 #include <cuda.h>
 
+#include <thread>
+
 static const std::string kCudfAdapterName = "cuDF";
 
 namespace facebook::velox::cudf_velox {
 
 namespace {
+
+std::shared_ptr<ucx_exchange::Communicator> ucxCommunicator;
+std::unique_ptr<std::thread> ucxCommunicatorThread;
+
+class UcxExchangeClientHandle final : public exec::ExchangeClientHandle {
+ public:
+  explicit UcxExchangeClientHandle(
+      std::shared_ptr<ucx_exchange::UcxExchangeClient> client)
+      : client_(std::move(client)) {
+    VELOX_CHECK_NOT_NULL(client_);
+  }
+
+  void close() override {
+    client_->close();
+  }
+
+  void addRemoteTaskId(const std::string& remoteTaskId) override {
+    client_->addRemoteTaskId(remoteTaskId);
+  }
+
+  void noMoreRemoteTasks() override {
+    client_->noMoreRemoteTasks();
+  }
+
+  folly::dynamic toJson() const override {
+    return client_->toJson();
+  }
+
+  const std::shared_ptr<ucx_exchange::UcxExchangeClient>& client() const {
+    return client_;
+  }
+
+ private:
+  const std::shared_ptr<ucx_exchange::UcxExchangeClient> client_;
+};
+
+void registerUcxTransports() {
+  exec::OutputTransportEntry output;
+  output.initializeTask =
+      [](std::shared_ptr<exec::Task> task,
+         core::PartitionedOutputNode::Kind kind,
+         int numDestinations,
+         int numDrivers) {
+        ucx_exchange::UcxOutputQueueManager::getInstanceRef()->initializeTask(
+            std::move(task), kind, numDestinations, numDrivers);
+      };
+  output.removeTask = [](const std::string& taskId) {
+    ucx_exchange::UcxOutputQueueManager::getInstanceRef()->removeTask(taskId);
+  };
+  output.updateOutputBuffers =
+      [](const std::string& taskId, int numBuffers, bool noMore) {
+        return ucx_exchange::UcxOutputQueueManager::getInstanceRef()
+            ->updateOutputBuffers(taskId, numBuffers, noMore);
+      };
+  output.updateNumDrivers =
+      [](const std::string& taskId, uint32_t newNumDrivers) {
+        return ucx_exchange::UcxOutputQueueManager::getInstanceRef()
+            ->updateNumDrivers(taskId, newNumDrivers);
+      };
+  output.stats = [](const std::string& taskId) {
+    return ucx_exchange::UcxOutputQueueManager::getInstanceRef()->stats(
+        taskId);
+  };
+  output.getUtilization = [](const std::string& taskId) {
+    return ucx_exchange::UcxOutputQueueManager::getInstanceRef()
+        ->getUtilization(taskId)
+        .value_or(0);
+  };
+  output.isOverutilized = [](const std::string& taskId) {
+    return ucx_exchange::UcxOutputQueueManager::getInstanceRef()
+        ->isOverutilized(taskId)
+        .value_or(false);
+  };
+  output.createOperator =
+      [](int32_t operatorId,
+         exec::DriverCtx* ctx,
+         const std::shared_ptr<const core::PartitionedOutputNode>& planNode,
+         bool eagerFlush) {
+        return std::make_unique<ucx_exchange::UcxPartitionedOutput>(
+            operatorId, ctx, planNode, eagerFlush);
+      };
+  exec::OutputTransportRegistry::registerTransport(
+      std::string{core::TransportKind::kUcx}, std::move(output));
+
+  exec::ExchangeTransportEntry input;
+  input.createClient =
+      [](const std::string& taskId,
+         int destination,
+         int32_t numberOfConsumers,
+         exec::Task* /*task*/,
+         const core::PlanNodeId& /*planNodeId*/,
+         int32_t /*pipelineId*/) {
+        return std::make_shared<UcxExchangeClientHandle>(
+            std::make_shared<ucx_exchange::UcxExchangeClient>(
+                taskId, destination, numberOfConsumers));
+      };
+  input.createOperator =
+      [](int32_t operatorId,
+         exec::DriverCtx* ctx,
+         const std::shared_ptr<const core::ExchangeNode>& planNode,
+         std::shared_ptr<exec::ExchangeClientHandle> client) {
+        auto* ucx = dynamic_cast<UcxExchangeClientHandle*>(client.get());
+        VELOX_CHECK_NOT_NULL(ucx, "UCX exchange requires a UCX client");
+        return std::make_unique<ucx_exchange::UcxExchange>(
+            operatorId, ctx, planNode, ucx->client());
+      };
+  exec::ExchangeTransportRegistry::registerTransport(
+      std::string{core::TransportKind::kUcx}, std::move(input));
+}
+
+void unregisterUcxTransports() {
+  exec::OutputTransportRegistry::unregisterTransport(core::TransportKind::kUcx);
+  exec::ExchangeTransportRegistry::unregisterTransport(
+      core::TransportKind::kUcx);
+}
 
 template <class... Deriveds, class Base>
 bool isAnyOf(const Base* p) {
@@ -294,6 +419,35 @@ bool cudfIsRegistered() {
   return isCudfRegistered;
 }
 
+void startUcxExchange(uint16_t port) {
+  if (!CudfConfig::getInstance().exchange) {
+    return;
+  }
+  ContinueFuture ready;
+  ucxCommunicator =
+      ucx_exchange::Communicator::initAndGet(port, "", &ready);
+  VELOX_CHECK_NOT_NULL(ucxCommunicator);
+  ucxCommunicatorThread = std::make_unique<std::thread>(
+      &ucx_exchange::Communicator::run, ucxCommunicator.get());
+  ready.wait();
+  exec::setOutputBuffersUpdateHook(
+      [](const std::string& taskId, int numBuffers, bool noMoreBuffers) {
+        ucx_exchange::UcxOutputQueueManager::getInstanceRef()
+            ->updateOutputBuffers(taskId, numBuffers, noMoreBuffers);
+      });
+}
+
+void stopUcxExchange() {
+  if (!ucxCommunicator) {
+    return;
+  }
+  ucxCommunicator->stop();
+  ucxCommunicatorThread->join();
+  exec::setOutputBuffersUpdateHook({});
+  ucxCommunicatorThread.reset();
+  ucxCommunicator.reset();
+}
+
 void registerCudf() {
   if (cudfIsRegistered()) {
     return;
@@ -335,6 +489,10 @@ void registerCudf() {
   exec::DriverAdapter cudfAdapter{kCudfAdapterName, {}, cda};
   exec::DriverFactory::registerAdapter(cudfAdapter);
 
+  if (CudfConfig::getInstance().exchange) {
+    registerUcxTransports();
+  }
+
   if (CudfConfig::getInstance().astExpressionEnabled) {
     registerAstEvaluator(CudfConfig::getInstance().astExpressionPriority);
   }
@@ -347,6 +505,7 @@ void registerCudf() {
 }
 
 void unregisterCudf() {
+  unregisterUcxTransports();
   output_mr_.reset();
   mr_.reset();
   exec::DriverFactory::adapters.erase(

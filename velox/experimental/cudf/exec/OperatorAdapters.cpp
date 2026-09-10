@@ -47,6 +47,7 @@
 #include "velox/exec/AssignUniqueId.h"
 #include "velox/exec/CallbackSink.h"
 #include "velox/exec/EnforceSingleRow.h"
+#include "velox/exec/Exchange.h"
 #include "velox/exec/FilterProject.h"
 #include "velox/exec/GroupId.h"
 #include "velox/exec/HashAggregation.h"
@@ -69,9 +70,10 @@
 #include "velox/exec/TopN.h"
 #include "velox/exec/Values.h"
 #include "velox/exec/Window.h"
+#include "velox/experimental/ucx-exchange/UcxExchange.h"
+#include "velox/experimental/ucx-exchange/UcxPartitionedOutput.h"
 
 #include <cctype>
-
 namespace facebook::velox::cudf_velox {
 
 /// OperatorAdapterRegistry Implementation
@@ -1264,6 +1266,42 @@ class LocalMergeAdapter : public OperatorAdapter {
   }
 };
 
+class UcxExchangeAdapter : public OperatorAdapter {
+ public:
+  UcxExchangeAdapter() : OperatorAdapter("UcxExchange") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const ucx_exchange::UcxExchange*>(op) != nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/) const override {
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return true;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const override {
+    return {};
+  }
+
+  bool keepOperator() const override {
+    return true;
+  }
+};
+
 /// PartitionedOutputAdapter - Keeps original operator (CPU sink for shuffle)
 class PartitionedOutputAdapter : public OperatorAdapter {
  public:
@@ -1293,7 +1331,44 @@ class PartitionedOutputAdapter : public OperatorAdapter {
       const core::PlanNodePtr& /*planNode*/,
       exec::DriverCtx* /*ctx*/,
       int32_t /*operatorId*/) const override {
-    return {}; // Keep original operator
+    return {};
+  }
+
+  bool keepOperator() const override {
+    return true;
+  }
+};
+
+class UcxPartitionedOutputAdapter : public OperatorAdapter {
+ public:
+  UcxPartitionedOutputAdapter() : OperatorAdapter("UcxPartitionedOutput") {}
+
+  bool canHandle(const exec::Operator* op) const override {
+    return dynamic_cast<const ucx_exchange::UcxPartitionedOutput*>(op) !=
+        nullptr;
+  }
+
+  bool canRunOnGPU(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/) const override {
+    return true;
+  }
+
+  bool acceptsGpuInput() const override {
+    return true;
+  }
+
+  bool producesGpuOutput() const override {
+    return false;
+  }
+
+  std::vector<std::unique_ptr<exec::Operator>> createReplacements(
+      const exec::Operator* /*op*/,
+      const core::PlanNodePtr& /*planNode*/,
+      exec::DriverCtx* /*ctx*/,
+      int32_t /*operatorId*/) const override {
+    return {};
   }
 
   bool keepOperator() const override {
@@ -1424,7 +1499,9 @@ void registerAllOperatorAdapters() {
   registry.registerAdapter(std::make_unique<GroupIdAdapter>());
   registry.registerAdapter(std::make_unique<ValuesAdapter>());
   registry.registerAdapter(std::make_unique<CallbackSinkAdapter>());
+  registry.registerAdapter(std::make_unique<UcxExchangeAdapter>());
   registry.registerAdapter(std::make_unique<PartitionedOutputAdapter>());
+  registry.registerAdapter(std::make_unique<UcxPartitionedOutputAdapter>());
   registry.registerAdapter(std::make_unique<WindowAdapter>());
 }
 

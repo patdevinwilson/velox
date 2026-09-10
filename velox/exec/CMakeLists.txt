@@ -33,6 +33,8 @@ velox_add_library(
   ExchangeClient.cpp
   ExchangeQueue.cpp
   ExchangeSource.cpp
+  ExchangeTransportRegistry.cpp
+  OutputTransportRegistry.cpp
   SerializedPage.cpp
   Expand.cpp
   FilterProject.cpp
@@ -133,6 +135,8 @@ velox_add_library(
   ExchangeClient.h
   ExchangeQueue.h
   ExchangeSource.h
+  ExchangeTransportRegistry.h
+  OutputTransportRegistry.h
   Expand.h
   FilterProject.h
   GroupId.h

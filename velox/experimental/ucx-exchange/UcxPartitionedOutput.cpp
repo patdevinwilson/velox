@@ -19,6 +19,7 @@
 #include "velox/core/QueryConfig.h"
 #include "velox/exec/Driver.h"
 #include "velox/exec/Operator.h"
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/Utilities.h"
 #include "velox/experimental/cudf/vector/CudfVector.h"
 
@@ -68,9 +69,11 @@ UcxPartitionedOutput::UcxPartitionedOutput(
           fmt::format("[{}]", planNode->id())),
       queueManager_(UcxOutputQueueManager::getInstanceRef()),
       numPartitions_(planNode->numPartitions()),
+      kind_(planNode->kind()),
       pipelineId_(ctx->pipelineId),
       driverId_(ctx->driverId),
-      targetRowsPerChunk_(ctx->queryConfig().ucxPartitionedOutputBatchRows()) {
+      targetRowsPerChunk_(
+          CudfConfig::getInstance().partitionedOutputBatchRows) {
   this->initPartitionKeys(planNode);
   auto sources = planNode->sources();
   std::vector<std::string> inNames, outNames;
@@ -158,6 +161,10 @@ void UcxPartitionedOutput::flushPending() {
 
     // Partition + enqueue (identical to previous addInput logic).
     auto queueManager = sharedQueueManager();
+    if (kind_ == core::PartitionedOutputNode::Kind::kArbitrary) {
+      numPartitions_ = queueManager->numDestinations(taskId());
+      VELOX_CHECK_GT(numPartitions_, 0);
+    }
     if (numPartitions_ > 1) {
       if (partitionKeyIndices_.size() > 0 || spec_ == "gather") {
         hashPartition(tableView, stream);
@@ -222,7 +229,16 @@ RowVectorPtr UcxPartitionedOutput::getOutput() {
 }
 
 bool UcxPartitionedOutput::isFinished() {
-  return finished_;
+  return finished_ && sharedQueueManager()->isFinished(taskId());
+}
+
+void UcxPartitionedOutput::close() {
+  if (closed_) {
+    return;
+  }
+  closed_ = true;
+  sharedQueueManager()->producerClosed(taskId());
+  Operator::close();
 }
 
 std::shared_ptr<facebook::velox::ucx_exchange::UcxOutputQueueManager>

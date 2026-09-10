@@ -16,7 +16,6 @@
 #pragma once
 
 #include <cudf/contiguous_split.hpp>
-#include <velox/exec/OutputBufferManager.h>
 #include <velox/exec/Task.h>
 #include <functional>
 #include <string_view>
@@ -25,7 +24,7 @@
 
 namespace facebook::velox::ucx_exchange {
 
-class UcxOutputQueueManager : public exec::OutputBufferManager {
+class UcxOutputQueueManager {
  public:
   /// Factory method to retrieve a reference to the output queue manager.
   static std::shared_ptr<UcxOutputQueueManager> getInstanceRef();
@@ -53,7 +52,7 @@ class UcxOutputQueueManager : public exec::OutputBufferManager {
       core::PartitionedOutputNode::Kind kind,
       int numDestinations,
       int numDrivers,
-      const std::string& transportOptions = {}) override;
+      const std::string& transportOptions = {});
 
   /// @brief Updates the number of destination buffers for a task.
   /// For broadcast mode, new destinations are backfilled with previously
@@ -61,7 +60,7 @@ class UcxOutputQueueManager : public exec::OutputBufferManager {
   bool updateOutputBuffers(
       const std::string& taskId,
       int numBuffers,
-      bool noMoreBuffers) override;
+      bool noMoreBuffers);
 
   /// @brief Enqueues a cudf packed column into the queue.
   /// @param taskId The unique task Id.
@@ -91,6 +90,10 @@ class UcxOutputQueueManager : public exec::OutputBufferManager {
   /// have been fetched and acknowledged.
   bool isFinished(std::string_view taskId);
 
+  size_t numDestinations(std::string_view taskId);
+
+  void producerClosed(std::string_view taskId);
+
   /// @brief
   void deleteResults(std::string_view taskId, int destination);
 
@@ -117,21 +120,20 @@ class UcxOutputQueueManager : public exec::OutputBufferManager {
 
   /// @brief Removes the queue for the given task from the queue manager.
   /// Calls "terminate" on the queue to awake waiting producers.
-  void removeTask(const std::string& taskId) override;
+  void removeTask(const std::string& taskId);
 
   /// @brief Returns the queue statistics of the queue associated with the given
   /// task. Returns nullopt when the specified output queue doesn't exist.
   std::optional<exec::OutputBuffer::Stats> stats(
-      const std::string& taskId) override;
+      const std::string& taskId);
 
-  bool updateNumDrivers(const std::string& taskId, uint32_t newNumDrivers)
-      override;
+  bool updateNumDrivers(const std::string& taskId, uint32_t newNumDrivers);
 
-  std::optional<double> getUtilization(const std::string& taskId) override;
+  std::optional<double> getUtilization(const std::string& taskId);
 
-  std::optional<bool> isOverutilized(const std::string& taskId) override;
+  std::optional<bool> isOverutilized(const std::string& taskId);
 
-  std::string toString(const std::string& taskId) override;
+  std::string toString(const std::string& taskId);
 
  private:
   // Retrieves the queue for a task if it exists.
@@ -152,6 +154,14 @@ class UcxOutputQueueManager : public exec::OutputBufferManager {
   // that exceed the placeholder's undersized queues_ vector.
   folly::Synchronized<std::unordered_set<std::string>, std::mutex>
       removedTasks_;
+
+  // Coordinator updates may arrive before the partitioned-output operator
+  // initializes its queue. Keep the latest update so initializeTask can replay
+  // it instead of leaving dynamic output queues permanently open.
+  folly::Synchronized<
+      std::unordered_map<std::string, std::pair<int, bool>>,
+      std::mutex>
+      outputBufferUpdates_;
 };
 
 } // namespace facebook::velox::ucx_exchange

@@ -846,14 +846,6 @@ bool canGroupbyBeEvaluatedByCudf(
 
   // Check supported aggregation functions using step-aware aggregation registry
   for (const auto& aggregate : aggregationNode.aggregates()) {
-    // Decimal AVG/SUM intermediate state merge is unreliable for large
-    // cardinality joins (SpatialBench Q10): FINAL sees key count ≠ serialized
-    // decimal payload rows. Keep those aggregations on CPU.
-    if (aggregate.rawInputTypes.size() == 1 &&
-        aggregate.rawInputTypes[0]->isDecimal()) {
-      return false;
-    }
-
     // Use step-aware validation that handles partial/final/intermediate steps
     if (!canGroupbyAggregationBeEvaluatedByCudf(
             *aggregate.call, step, aggregate.rawInputTypes, queryCtx)) {

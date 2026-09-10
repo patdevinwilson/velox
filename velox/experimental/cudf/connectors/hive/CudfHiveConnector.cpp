@@ -19,8 +19,10 @@
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSink.h"
 #include "velox/experimental/cudf/connectors/hive/CudfHiveDataSource.h"
 #include "velox/experimental/cudf/exec/ToCudf.h"
+#include "velox/experimental/cudf/exec/VeloxCudfInterop.h"
 
 #include "velox/connectors/hive/HiveDataSource.h"
+#include "velox/connectors/hive/HiveDataSink.h"
 
 namespace facebook::velox::cudf_velox::connector::hive {
 
@@ -74,6 +76,37 @@ std::unique_ptr<DataSink> CudfHiveConnector::createDataSink(
   auto cudfHiveInsertHandle =
       std::dynamic_pointer_cast<const CudfHiveInsertTableHandle>(
           connectorInsertTableHandle);
+  if (!cudfHiveInsertHandle) {
+    auto hiveInsertHandle = std::dynamic_pointer_cast<
+        const ::facebook::velox::connector::hive::HiveInsertTableHandle>(
+        connectorInsertTableHandle);
+    VELOX_CHECK_NOT_NULL(
+        hiveInsertHandle,
+        "cuDF Hive connector expects a Hive write handle");
+    VELOX_USER_CHECK_EQ(
+        hiveInsertHandle->storageFormat(),
+        dwio::common::FileFormat::PARQUET,
+        "cuDF Hive data sink only supports PARQUET");
+
+    std::vector<std::shared_ptr<const CudfHiveColumnHandle>> inputColumns;
+    inputColumns.reserve(hiveInsertHandle->inputColumns().size());
+    for (const auto& column : hiveInsertHandle->inputColumns()) {
+      inputColumns.push_back(std::make_shared<const CudfHiveColumnHandle>(
+          column->name(),
+          column->dataType(),
+          veloxToCudfDataType(column->dataType())));
+    }
+    auto location = std::make_shared<const LocationHandle>(
+        hiveInsertHandle->locationHandle()->targetPath(),
+        LocationHandle::TableType::kNew,
+        hiveInsertHandle->locationHandle()->targetFileName());
+    cudfHiveInsertHandle = std::make_shared<const CudfHiveInsertTableHandle>(
+        std::move(inputColumns),
+        std::move(location),
+        hiveInsertHandle->compressionKind(),
+        hiveInsertHandle->serdeParameters(),
+        hiveInsertHandle->writerOptions());
+  }
   VELOX_CHECK_NOT_NULL(
       cudfHiveInsertHandle,
       "cuDF Hive connector expects a cuDF Hive write handle");

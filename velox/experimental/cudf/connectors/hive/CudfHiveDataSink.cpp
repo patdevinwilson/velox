@@ -207,7 +207,11 @@ CudfHiveDataSink::createCudfWriter(
       ? fmt::format("{}{}", makeUuid(), ".parquet")
       : locationHandle->targetFileName();
 
-  fs::create_directories(locationHandle->targetPath());
+  auto localTargetPath = locationHandle->targetPath();
+  if (localTargetPath.starts_with("file:")) {
+    localTargetPath.erase(0, 5);
+  }
+  fs::create_directories(localTargetPath);
 
   auto writerParameters = CudfHiveWriterParameters(
       CudfHiveWriterParameters::UpdateMode::kNew,
@@ -221,7 +225,7 @@ CudfHiveDataSink::createCudfWriter(
 
   // Create writer options for the given sink
   const auto sinkInfo = cudf::io::sink_info(
-      fmt::format("{}/{}", locationHandle->targetPath(), targetFileName));
+      fmt::format("{}/{}", localTargetPath, targetFileName));
   auto cudfWriterOptions =
       cudf::io::chunked_parquet_writer_options::builder(sinkInfo)
           .metadata(tableInputMetadata)

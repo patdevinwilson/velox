@@ -51,6 +51,7 @@
 
 #include <limits>
 #include <optional>
+#include <span>
 #include <unordered_set>
 #include <utility>
 
@@ -140,6 +141,113 @@ bool rangeWindowTypesEqual(
     const cudf::range_window_type& right) {
   // Batch gating only uses unbounded/current_row; index distinguishes kinds.
   return left.index() == right.index();
+}
+
+struct RangeOrderBy {
+  std::vector<cudf::column_view> columnViews;
+  ColumnOrView orderByColumnOwner;
+  cudf::table_view table;
+  std::vector<cudf::order> orders;
+  std::vector<cudf::null_order> nullOrders;
+
+  static RangeOrderBy fromSortedView(
+      const cudf::table_view& sortedView,
+      const std::vector<cudf::size_type>& sortKeyIndices,
+      const std::vector<cudf::order>& sortOrders,
+      const std::vector<cudf::null_order>& nullOrders,
+      rmm::cuda_stream_view stream,
+      rmm::device_async_resource_ref mr) {
+    RangeOrderBy result;
+    if (sortKeyIndices.empty()) {
+      auto oneScalar = cudf::numeric_scalar<int64_t>(1, true, stream, mr);
+      result.orderByColumnOwner =
+          cudf::sequence(sortedView.num_rows(), oneScalar, oneScalar, stream, mr);
+      result.columnViews.push_back(asView(result.orderByColumnOwner));
+      result.orders.push_back(cudf::order::ASCENDING);
+      result.nullOrders.push_back(cudf::null_order::BEFORE);
+    } else {
+      result.columnViews.reserve(sortKeyIndices.size());
+      for (auto idx : sortKeyIndices) {
+        result.columnViews.push_back(sortedView.column(idx));
+      }
+      result.orders = sortOrders;
+      result.nullOrders = nullOrders;
+    }
+    result.table = cudf::table_view(result.columnViews);
+    return result;
+  }
+};
+
+std::unique_ptr<cudf::table> invokeGroupedRangeRollingBatch(
+    const cudf::table_view& partKeys,
+    const RangeOrderBy& orderby,
+    cudf::range_window_type preceding,
+    cudf::range_window_type following,
+    std::vector<cudf::rolling_request>& requests,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  if (orderby.columnViews.size() == 1) {
+    return cudf::grouped_range_rolling_window(
+        partKeys,
+        orderby.columnViews[0],
+        orderby.orders[0],
+        orderby.nullOrders[0],
+        preceding,
+        following,
+        std::span<cudf::rolling_request const>(
+            requests.data(), requests.size()),
+        stream,
+        mr);
+  }
+  return cudf::grouped_range_rolling_window(
+      partKeys,
+      orderby.table,
+      cudf::host_span<cudf::order const>(
+          orderby.orders.data(), orderby.orders.size()),
+      cudf::host_span<cudf::null_order const>(
+          orderby.nullOrders.data(), orderby.nullOrders.size()),
+      preceding,
+      following,
+      cudf::host_span<cudf::rolling_request const>(
+          requests.data(), requests.size()),
+      stream,
+      mr);
+}
+
+struct RankValuesBuild {
+  ColumnOrView sequenceColOwner;
+  std::vector<cudf::column_view> structChildren;
+};
+
+cudf::column_view buildRankValuesCol(
+    const cudf::table_view& sortedInput,
+    const std::string& baseName,
+    const std::vector<cudf::size_type>& sortKeyIndices,
+    RankValuesBuild& holder,
+    rmm::cuda_stream_view stream,
+    rmm::device_async_resource_ref mr) {
+  const auto n = sortedInput.num_rows();
+  if (sortKeyIndices.empty()) {
+    auto oneScalar = cudf::numeric_scalar<int64_t>(1, true, stream, mr);
+    holder.sequenceColOwner =
+        cudf::sequence(n, oneScalar, oneScalar, stream, mr);
+    return asView(holder.sequenceColOwner);
+  }
+  if (sortKeyIndices.size() == 1 || baseName == "row_number") {
+    return sortedInput.column(sortKeyIndices[0]);
+  }
+  holder.structChildren.reserve(sortKeyIndices.size());
+  for (auto idx : sortKeyIndices) {
+    holder.structChildren.push_back(sortedInput.column(idx));
+  }
+  return cudf::column_view(
+      cudf::data_type{cudf::type_id::STRUCT},
+      n,
+      nullptr,
+      nullptr,
+      0,
+      0,
+      holder.structChildren);
 }
 
 RangeRollingBatch* findRangeRollingBatch(
@@ -417,13 +525,6 @@ bool CudfWindow::canRunOnGPU(const core::WindowNode& windowNode) {
 bool CudfWindow::canRunOnGPU(
     const core::WindowNode& windowNode,
     std::string* reason) {
-  if (windowNode.sortingKeys().size() > 1) {
-    if (reason) {
-      *reason = "Multi-column ORDER BY requires a cuDF upgrade (follow-on PR)";
-    }
-    return false;
-  }
-
   for (const auto& key : windowNode.partitionKeys()) {
     if (containsCustomComparison(key->type())) {
       if (reason) {
@@ -767,7 +868,6 @@ void CudfWindow::computeRankColumnsBatch(
   }
 
   const auto numRows = logicalRowCount_;
-  // Single-column ORDER BY only (multi-column rejected in canRunOnGPU).
   auto colOrder =
       sortKeyIndices_.empty() ? cudf::order::ASCENDING : sortOrders_[0];
   auto nullOrd =
@@ -786,7 +886,9 @@ void CudfWindow::computeRankColumnsBatch(
             cudf::sequence(numRows, oneScalar, oneScalar, stream, mr);
         continue;
       }
-      auto valuesCol = sortedInput.column(sortKeyIndices_[0]);
+      RankValuesBuild holder;
+      auto valuesCol = buildRankValuesCol(
+          sortedInput, baseName, sortKeyIndices_, holder, stream, mr);
       auto method = toRankMethod(baseName);
       auto agg = cudf::make_rank_aggregation<cudf::scan_aggregation>(
           method, colOrder, cudf::null_policy::INCLUDE, nullOrd);
@@ -805,6 +907,7 @@ void CudfWindow::computeRankColumnsBatch(
   scanRequests.reserve(pendingRanks.size());
   std::vector<size_t> batchedFuncIndices;
   batchedFuncIndices.reserve(pendingRanks.size());
+  std::vector<RankValuesBuild> valueHolders(pendingRanks.size());
 
   for (size_t i = 0; i < pendingRanks.size(); ++i) {
     const auto& [funcIndex, baseName] = pendingRanks[i];
@@ -814,12 +917,13 @@ void CudfWindow::computeRankColumnsBatch(
     }
 
     cudf::groupby::scan_request request;
-    if (!sortKeyIndices_.empty()) {
-      request.values = sortedInput.column(sortKeyIndices_[0]);
-    } else {
-      // row_number without ORDER BY: values column is unused for tie detection.
-      request.values = sortedInput.column(partitionKeyIndices_[0]);
-    }
+    request.values = buildRankValuesCol(
+        sortedInput,
+        baseName,
+        sortKeyIndices_,
+        valueHolders[i],
+        stream,
+        mr);
     request.aggregations.push_back(
         cudf::make_rank_aggregation<cudf::groupby_scan_aggregation>(
             toRankMethod(baseName),
@@ -1272,20 +1376,13 @@ RowVectorPtr CudfWindow::doGetOutput() {
       mr);
 
   if (!rangeRollingBatches.empty()) {
-    ColumnOrView orderbyColHolder{cudf::column_view{}};
-    cudf::column_view orderbyCol;
-    cudf::order order = cudf::order::ASCENDING;
-    cudf::null_order nullOrder = cudf::null_order::BEFORE;
-    if (sortKeyIndices_.empty()) {
-      auto oneScalar = cudf::numeric_scalar<int64_t>(1, true, stream_, mr);
-      orderbyColHolder =
-          cudf::sequence(logicalRowCount_, oneScalar, oneScalar, stream_, mr);
-      orderbyCol = asView(orderbyColHolder);
-    } else {
-      orderbyCol = sortedView.column(sortKeyIndices_[0]);
-      order = sortOrders_[0];
-      nullOrder = nullOrders_[0];
-    }
+    auto rangeOrderBy = RangeOrderBy::fromSortedView(
+        sortedView,
+        sortKeyIndices_,
+        sortOrders_,
+        nullOrders_,
+        stream_,
+        mr);
     for (auto& batch : rangeRollingBatches) {
       auto& pendingRequests = batch.requests;
       std::vector<cudf::rolling_request> rollingRequests;
@@ -1294,15 +1391,12 @@ RowVectorPtr CudfWindow::doGetOutput() {
         rollingRequests.push_back(
             cudf::rolling_request{pending.inputCol, 1, std::move(pending.agg)});
       }
-      auto batchResult = cudf::grouped_range_rolling_window(
+      auto batchResult = invokeGroupedRangeRollingBatch(
           partKeys,
-          orderbyCol,
-          order,
-          nullOrder,
+          rangeOrderBy,
           batch.preceding,
           batch.following,
-          cudf::host_span<cudf::rolling_request const>(
-              rollingRequests.data(), rollingRequests.size()),
+          rollingRequests,
           stream_,
           mr);
       auto resultCols = batchResult->release();

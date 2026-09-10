@@ -57,7 +57,8 @@ namespace facebook::velox::cudf_velox {
 /// larger redesign.
 ///
 /// Rank-like functions (row_number, rank, dense_rank) use
-/// cudf::groupby::scan with cudf::make_rank_aggregation.
+/// cudf::groupby::scan with cudf::make_rank_aggregation. Multi-column
+/// ORDER BY packs the sort keys into a STRUCT for tie detection.
 /// Uses cudf::grouped_rolling_window for most aggregate windows and lag/lead.
 /// Full-partition REAL/DOUBLE/DECIMAL AVG runs on cuDF's optimized fully
 /// unbounded SUM and COUNT rolling path, covering OVER (),

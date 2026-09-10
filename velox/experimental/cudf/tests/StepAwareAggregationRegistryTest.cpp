@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include "velox/experimental/cudf/CudfConfig.h"
 #include "velox/experimental/cudf/exec/AggregationRegistry.h"
 #include "velox/experimental/cudf/exec/CudfGroupby.h"
 #include "velox/experimental/cudf/exec/CudfReduce.h"
@@ -278,6 +279,31 @@ TEST_F(StepAwareAggregationRegistryTest, sumStepConsistency) {
   EXPECT_TRUE(sumPartial) << "Sum partial step should be supported";
   EXPECT_TRUE(sumFinal) << "Sum final step should be supported";
   EXPECT_TRUE(sumIntermediate) << "Sum intermediate step should be supported";
+}
+
+TEST_F(StepAwareAggregationRegistryTest, decimalSumFinalVarbinaryPrestoPrefix) {
+  auto& config = CudfConfig::getInstance();
+  const auto previousPrefix = config.functionNamePrefix;
+  config.functionNamePrefix = "presto.default.";
+  unregisterCudf();
+  registerCudf();
+
+  auto sumCall = std::make_shared<core::CallTypedExpr>(
+      DECIMAL(38, 2),
+      std::vector<core::TypedExprPtr>{
+          std::make_shared<core::FieldAccessTypedExpr>(VARBINARY(), "sum_547")},
+      "presto.default.sum");
+
+  EXPECT_TRUE(canGroupbyAggregationBeEvaluatedByCudf(
+      *sumCall,
+      core::AggregationNode::Step::kFinal,
+      {DECIMAL(12, 2)},
+      queryCtx_.get()))
+      << "Presto FINAL decimal sum(VARBINARY) must stay on GPU";
+
+  config.functionNamePrefix = previousPrefix;
+  unregisterCudf();
+  registerCudf();
 }
 
 TEST_F(StepAwareAggregationRegistryTest, countStepConsistency) {

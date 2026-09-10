@@ -456,8 +456,7 @@ TEST_F(CudfWindowTest, rowNumberMultiBatch) {
   AssertQueryBuilder(plan).assertResults(expected);
 }
 
-// Multi-column ORDER BY covered in follow-on PR (requires cuDF upgrade).
-TEST_F(CudfWindowTest, DISABLED_multiFunctionPartitionOrder) {
+TEST_F(CudfWindowTest, multiFunctionPartitionOrder) {
   // Same shape as valuesRowsStreamingWindowBuild (CPU) but non-streaming window
   // and explicit expected vectors (no DuckDB runner).
   auto data = makeRowVector(
@@ -498,6 +497,36 @@ TEST_F(CudfWindowTest, DISABLED_multiFunctionPartitionOrder) {
           makeFlatVector<int64_t>({1, 2, 3, 1, 2}),
           makeFlatVector<int64_t>({1, 2, 3, 1, 2}),
           makeFlatVector<int64_t>({10, 30, 60, 100, 300}),
+      });
+
+  AssertQueryBuilder(plan).assertResults(expected);
+}
+
+// Q47/Q57 shape: rank() RANGE UNBOUNDED PRECEDING TO CURRENT ROW with two
+// ORDER BY keys. Ties must use the full key, not the first column alone.
+TEST_F(CudfWindowTest, rankMultiColumnOrderByTies) {
+  auto data = makeRowVector(
+      {"p", "y", "m"},
+      {
+          makeFlatVector<int32_t>({1, 1, 1, 1}),
+          makeFlatVector<int32_t>({2000, 2000, 2001, 2001}),
+          makeFlatVector<int32_t>({1, 2, 1, 1}),
+      });
+
+  auto plan =
+      PlanBuilder()
+          .values({data})
+          .window({"rank() over (partition by p order by y, m)"})
+          .orderBy({"y ASC NULLS LAST", "m ASC NULLS LAST"}, false)
+          .planNode();
+
+  auto expected = makeRowVector(
+      {"p", "y", "m", "w0"},
+      {
+          makeFlatVector<int32_t>({1, 1, 1, 1}),
+          makeFlatVector<int32_t>({2000, 2000, 2001, 2001}),
+          makeFlatVector<int32_t>({1, 2, 1, 1}),
+          makeFlatVector<int64_t>({1, 2, 3, 3}),
       });
 
   AssertQueryBuilder(plan).assertResults(expected);

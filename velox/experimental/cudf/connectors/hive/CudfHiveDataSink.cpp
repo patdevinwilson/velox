@@ -207,6 +207,8 @@ CudfHiveDataSink::createCudfWriter(
       ? fmt::format("{}{}", makeUuid(), ".parquet")
       : locationHandle->targetFileName();
 
+  fs::create_directories(locationHandle->targetPath());
+
   auto writerParameters = CudfHiveWriterParameters(
       CudfHiveWriterParameters::UpdateMode::kNew,
       targetFileName,

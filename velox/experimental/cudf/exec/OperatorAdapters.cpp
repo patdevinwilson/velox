@@ -42,6 +42,7 @@
 #include "velox/experimental/cudf/expression/ExpressionEvaluator.h"
 
 #include "velox/connectors/ConnectorRegistry.h"
+#include "velox/connectors/hive/HiveDataSink.h"
 #include "velox/exec/AssignUniqueId.h"
 #include "velox/exec/CallbackSink.h"
 #include "velox/exec/EnforceSingleRow.h"
@@ -1134,10 +1135,17 @@ class TableWriteAdapter : public OperatorAdapter {
     if (!node || node->hasColumnStatsSpec()) {
       return false;
     }
-    return std::dynamic_pointer_cast<
-               const connector::hive::CudfHiveInsertTableHandle>(
-               node->insertTableHandle()->connectorInsertTableHandle()) !=
-        nullptr;
+    const auto& handle =
+        node->insertTableHandle()->connectorInsertTableHandle();
+    if (std::dynamic_pointer_cast<
+            const connector::hive::CudfHiveInsertTableHandle>(handle)) {
+      return true;
+    }
+    auto hiveHandle = std::dynamic_pointer_cast<
+        const ::facebook::velox::connector::hive::HiveInsertTableHandle>(
+        handle);
+    return hiveHandle &&
+        hiveHandle->storageFormat() == dwio::common::FileFormat::PARQUET;
   }
 
   bool acceptsGpuInput() const override {

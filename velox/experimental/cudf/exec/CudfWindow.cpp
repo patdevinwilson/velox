@@ -194,7 +194,7 @@ std::unique_ptr<cudf::table> invokeGroupedRangeRollingBatch(
         orderby.nullOrders[0],
         preceding,
         following,
-        std::span<cudf::rolling_request const>(
+        cudf::host_span<cudf::rolling_request const>(
             requests.data(), requests.size()),
         stream,
         mr);

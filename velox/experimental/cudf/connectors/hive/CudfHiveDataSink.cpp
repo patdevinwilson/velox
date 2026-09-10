@@ -418,6 +418,8 @@ std::vector<std::string> CudfHiveDataSink::close() {
   // clang-format off
     auto partitionUpdateJson = folly::toJson(
      folly::dynamic::object
+        ("name", "")
+        ("updateMode", "NEW")
         ("writePath", writerInfo_->writerParameters.writeDirectory())
         ("targetPath", writerInfo_->writerParameters.targetDirectory())
         ("fileWriteInfos", folly::dynamic::array(

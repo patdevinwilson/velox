@@ -50,6 +50,29 @@ class LocalVectorIndexAccelerator {
         int64_t k,
         std::span<int64_t> ids,
         std::span<float> scores) const = 0;
+
+    /// Searches as search() does with 'queries', 'ids' and 'scores' in device
+    /// memory, ordering the work on 'stream', a cudaStream_t. 'k' is between 1
+    /// and the size of the index. Writes the ids the device search returns,
+    /// which deviceIdMap() maps to the local index's ids. Returns false,
+    /// having written nothing, if the device cannot run the search.
+    virtual bool searchDevice(
+        const float* /*queries*/,
+        int64_t /*numQueries*/,
+        int64_t /*k*/,
+        int64_t* /*ids*/,
+        float* /*scores*/,
+        void* /*stream*/) const {
+      return false;
+    }
+
+    /// Device array mapping the ids searchDevice() writes, from 0 to the size
+    /// of the index, to the local index's ids, or null if searchDevice()
+    /// writes the local index's ids. Any other id searchDevice() writes, such
+    /// as a negative id or the largest int64_t, is padding.
+    virtual const int64_t* deviceIdMap() const {
+      return nullptr;
+    }
   };
 
   virtual ~LocalVectorIndexAccelerator() = default;

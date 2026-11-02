@@ -38,6 +38,11 @@ struct GpuLocalVectorIndexOptions {
 
   /// Local indexes with fewer embeddings are built on the CPU.
   int64_t minBuildSize{0};
+
+  /// Loads every local index onto the device, ignoring 'minSearchSize'. A
+  /// kHnswSq index too small for a CAGRA graph becomes an exact flat index,
+  /// and a load that fails throws rather than leaving the index on the CPU.
+  bool requireDevice{false};
 };
 
 /// Returns an accelerator that runs local indexes on a GPU through FAISS GPU

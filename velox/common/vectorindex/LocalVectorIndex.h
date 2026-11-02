@@ -93,6 +93,15 @@ class LocalVectorIndex {
       VectorIndexMetric metric,
       const LocalVectorIndexOptions& searchOptions);
 
+  /// Reads a local index as above, giving it a device copy from
+  /// 'accelerator' rather than the one setLocalVectorIndexAccelerator() set.
+  /// A null 'accelerator' keeps the index on the CPU.
+  LocalVectorIndex(
+      std::string_view bytes,
+      VectorIndexMetric metric,
+      const LocalVectorIndexOptions& searchOptions,
+      const std::shared_ptr<const LocalVectorIndexAccelerator>& accelerator);
+
   ~LocalVectorIndex();
 
   VectorIndexType type() const;
@@ -105,6 +114,11 @@ class LocalVectorIndex {
   /// True if search() runs on an accelerator's device copy.
   bool accelerated() const {
     return accelerated_ != nullptr;
+  }
+
+  /// The device copy, or null if the index is searched on the CPU.
+  const LocalVectorIndexAccelerator::Index* deviceIndex() const {
+    return accelerated_.get();
   }
 
   /// Finds the 'k' embeddings nearest to each of 'queries', which must be

@@ -256,7 +256,18 @@ void LocalVectorIndex::build(
 LocalVectorIndex::LocalVectorIndex(
     std::string_view bytes,
     VectorIndexMetric metric,
-    const LocalVectorIndexOptions& searchOptions) {
+    const LocalVectorIndexOptions& searchOptions)
+    : LocalVectorIndex(
+          bytes,
+          metric,
+          searchOptions,
+          localVectorIndexAccelerator()) {}
+
+LocalVectorIndex::LocalVectorIndex(
+    std::string_view bytes,
+    VectorIndexMetric metric,
+    const LocalVectorIndexOptions& searchOptions,
+    const std::shared_ptr<const LocalVectorIndexAccelerator>& accelerator) {
   VELOX_CHECK(
       !searchOptions.nlist.has_value(),
       "Local vector index search options may not set nlist");
@@ -300,7 +311,7 @@ LocalVectorIndex::LocalVectorIndex(
     dynamic_cast<faiss::IndexHNSW*>(index)->hnsw.efSearch =
         *searchOptions.efSearch;
   }
-  if (const auto accelerator = localVectorIndexAccelerator()) {
+  if (accelerator != nullptr) {
     accelerated_ = accelerator->load(type_, *index_);
   }
 }
